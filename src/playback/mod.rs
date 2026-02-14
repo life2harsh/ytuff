@@ -3,7 +3,6 @@ use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -38,14 +37,13 @@ pub struct PlaybackHandle {
 struct PlaybackState {
     current_track_idx: Option<usize>,
     current_track_duration: Option<u64>,
-    current_track_path: Option<PathBuf>,
+    current_track_path: Option<std::path::PathBuf>,
     playback_start: Option<Instant>,
     elapsed_before_pause: u64,
     is_paused: bool,
     volume: f32,
     muted_volume: Option<f32>,
     current_device_name: Option<String>,
-    pending_seek: Option<u64>,
 }
 
 impl PlaybackState {
@@ -60,7 +58,6 @@ impl PlaybackState {
             volume: 1.0,
             muted_volume: None,
             current_device_name: None,
-            pending_seek: None,
         }
     }
 
@@ -115,26 +112,6 @@ pub fn start_playback_thread(core: Core) -> PlaybackHandle {
 
         loop {
             *position_clone.lock().unwrap() = state.update_position();
-
-            if let Some(seek_pos) = state.pending_seek.take() {
-                if let Some(idx) = state.current_track_idx {
-                    if let Some(ref path) = state.current_track_path.clone() {
-                        if let Some(sink) = sink_opt.take() {
-                            sink.stop();
-                        }
-                        play_track_from_path(
-                            &core,
-                            idx,
-                            path,
-                            &mut sink_opt,
-                            &stream_handle,
-                            &mut state,
-                            &position_clone,
-                            seek_pos,
-                        );
-                    }
-                }
-            }
 
             if let Some(ref sink) = sink_opt {
                 let _ = sink.is_paused();
@@ -275,17 +252,46 @@ pub fn start_playback_thread(core: Core) -> PlaybackHandle {
                                     &position_clone,
                                     0,
                                 );
-                            } else {
-                                state.pending_seek = Some(new_pos);
                             }
-                        } else {
-                            state.pending_seek = Some(new_pos);
+                        } else if let Some(idx) = state.current_track_idx {
+                            if let Some(ref path) = state.current_track_path.clone() {
+                                if let Some(sink) = sink_opt.take() {
+                                    sink.stop();
+                                }
+                                play_track_from_path(
+                                    &core,
+                                    idx,
+                                    path,
+                                    &mut sink_opt,
+                                    &stream_handle,
+                                    &mut state,
+                                    &position_clone,
+                                    new_pos,
+                                );
+                            }
                         }
                     }
                     PlaybackCommand::SkipBackward(secs) => {
                         let current = state.get_elapsed();
                         let new_pos = current.saturating_sub(secs);
-                        state.pending_seek = Some(new_pos);
+
+                        if let Some(idx) = state.current_track_idx {
+                            if let Some(ref path) = state.current_track_path.clone() {
+                                if let Some(sink) = sink_opt.take() {
+                                    sink.stop();
+                                }
+                                play_track_from_path(
+                                    &core,
+                                    idx,
+                                    path,
+                                    &mut sink_opt,
+                                    &stream_handle,
+                                    &mut state,
+                                    &position_clone,
+                                    new_pos,
+                                );
+                            }
+                        }
                     }
                     PlaybackCommand::VolumeUp => {
                         state.volume = (state.volume + 0.1).min(1.0);

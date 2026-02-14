@@ -16,6 +16,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FocusPanel {
+    Library,
+    Devices,
+}
+
 pub struct App {
     pub core: Core,
     pub playback: PlaybackHandle,
@@ -23,6 +29,7 @@ pub struct App {
     pub queue_state: ListState,
     pub device_state: ListState,
     pub devices: Vec<(String, bool)>,
+    pub focused_panel: FocusPanel,
     pub show_help: bool,
     pub show_devices: bool,
     pub message: Option<(String, Instant, bool)>,
@@ -48,6 +55,7 @@ impl App {
             queue_state,
             device_state,
             devices: Vec::new(),
+            focused_panel: FocusPanel::Library,
             show_help: false,
             show_devices: false,
             message: None,
@@ -151,16 +159,6 @@ impl App {
         }
     }
 
-    pub fn play_queue_item(&mut self) {
-        if let Some(pos) = self.queue_state.selected() {
-            let queue = self.core.queue.lock().unwrap();
-            if let Some(&track_idx) = queue.get(pos) {
-                drop(queue);
-                self.playback.tx.send(PlaybackCommand::PlayIndex(track_idx)).ok();
-            }
-        }
-    }
-
     pub fn add_to_queue(&mut self) {
         if let Some(idx) = self.library_state.selected() {
             self.core.enqueue(idx);
@@ -211,6 +209,21 @@ impl App {
             false
         }
     }
+
+    pub fn toggle_devices(&mut self) {
+        self.show_devices = !self.show_devices;
+        if self.show_devices {
+            self.focused_panel = FocusPanel::Devices;
+            self.refresh_devices();
+        } else {
+            self.focused_panel = FocusPanel::Library;
+        }
+    }
+
+    pub fn close_devices(&mut self) {
+        self.show_devices = false;
+        self.focused_panel = FocusPanel::Library;
+    }
 }
 
 pub async fn run_ui(core: Core, playback: PlaybackHandle) -> anyhow::Result<()> {
@@ -256,102 +269,114 @@ pub async fn run_ui(core: Core, playback: PlaybackHandle) -> anyhow::Result<()> 
             match ev {
                 CEvent::Key(key) => {
                     if key.kind == KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Esc => {
-                                if app.show_devices {
-                                    app.show_devices = false;
-                                } else if app.show_help {
+                        if app.show_help {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('h') => {
                                     app.show_help = false;
                                 }
+                                _ => {}
                             }
-                            KeyCode::Char('q') => {
-                                app.playback.tx.send(PlaybackCommand::Quit).ok();
-                                break;
-                            }
-                            KeyCode::Char(' ') => {
-                                app.playback.tx.send(PlaybackCommand::Pause).ok();
-                            }
-                            KeyCode::Char('r') => {
-                                app.playback.tx.send(PlaybackCommand::Resume).ok();
-                            }
-                            KeyCode::Char('n') => {
-                                app.playback.tx.send(PlaybackCommand::Next).ok();
-                            }
-                            KeyCode::Char('p') => {
-                                app.playback.tx.send(PlaybackCommand::Prev).ok();
-                            }
-                            KeyCode::Char('?') | KeyCode::Char('h') => {
-                                app.show_help = !app.show_help;
-                            }
-                            KeyCode::Char('d') => {
-                                app.show_devices = !app.show_devices;
-                                if app.show_devices {
-                                    app.refresh_devices();
+                        } else if app.show_devices {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.close_devices();
                                 }
-                            }
-                            KeyCode::Char('a') => app.add_to_queue(),
-                            KeyCode::Enter => {
-                                app.play_selected();
-                            }
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                app.next_library_item();
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                app.previous_library_item();
-                            }
-                            KeyCode::Char('J') => {
-                                if app.show_devices {
+                                KeyCode::Char('q') => {
+                                    app.playback.tx.send(PlaybackCommand::Quit).ok();
+                                    break;
+                                }
+                                KeyCode::Char('j') | KeyCode::Down => {
                                     app.next_device_item();
-                                } else {
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    app.previous_device_item();
+                                }
+                                KeyCode::Enter => {
+                                    app.select_device();
+                                    app.close_devices();
+                                }
+                                KeyCode::Char('d') => {
+                                    app.toggle_devices();
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Char('q') => {
+                                    app.playback.tx.send(PlaybackCommand::Quit).ok();
+                                    break;
+                                }
+                                KeyCode::Char(' ') => {
+                                    app.playback.tx.send(PlaybackCommand::Pause).ok();
+                                }
+                                KeyCode::Char('r') => {
+                                    app.playback.tx.send(PlaybackCommand::Resume).ok();
+                                }
+                                KeyCode::Char('n') => {
+                                    app.playback.tx.send(PlaybackCommand::Next).ok();
+                                }
+                                KeyCode::Char('p') => {
+                                    app.playback.tx.send(PlaybackCommand::Prev).ok();
+                                }
+                                KeyCode::Char('?') | KeyCode::Char('h') => {
+                                    app.show_help = true;
+                                }
+                                KeyCode::Char('d') => {
+                                    app.toggle_devices();
+                                }
+                                KeyCode::Char('a') => app.add_to_queue(),
+                                KeyCode::Enter => {
+                                    app.play_selected();
+                                }
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    app.next_library_item();
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    app.previous_library_item();
+                                }
+                                KeyCode::Char('J') => {
                                     app.next_queue_item();
                                 }
-                            }
-                            KeyCode::Char('K') => {
-                                if app.show_devices {
-                                    app.previous_device_item();
-                                } else {
+                                KeyCode::Char('K') => {
                                     app.previous_queue_item();
                                 }
-                            }
-                            KeyCode::Char('D') => {
-                                app.select_device();
-                            }
-                            KeyCode::Char('+') | KeyCode::Char('=') => {
-                                app.playback.tx.send(PlaybackCommand::VolumeUp).ok();
-                                let new_vol = ((app.current_volume + 0.1).min(1.0) * 100.0) as i32;
-                                app.set_message(format!("Volume: {}%", new_vol), true);
-                            }
-                            KeyCode::Char('-') => {
-                                app.playback.tx.send(PlaybackCommand::VolumeDown).ok();
-                                let new_vol = ((app.current_volume - 0.1).max(0.0) * 100.0) as i32;
-                                app.set_message(format!("Volume: {}%", new_vol), true);
-                            }
-                            KeyCode::Char('0') => {
-                                app.playback.tx.send(PlaybackCommand::ToggleMute).ok();
-                                if app.current_volume > 0.0 {
-                                    app.set_message("Volume: Muted".to_string(), true);
-                                } else {
-                                    let vol = (app.current_volume * 100.0) as i32;
-                                    app.set_message(format!("Volume: {}%", vol), true);
+                                KeyCode::Char('+') | KeyCode::Char('=') => {
+                                    app.playback.tx.send(PlaybackCommand::VolumeUp).ok();
+                                    let new_vol = ((app.current_volume + 0.1).min(1.0) * 100.0) as i32;
+                                    app.set_message(format!("Volume: {}%", new_vol), true);
                                 }
+                                KeyCode::Char('-') => {
+                                    app.playback.tx.send(PlaybackCommand::VolumeDown).ok();
+                                    let new_vol = ((app.current_volume - 0.1).max(0.0) * 100.0) as i32;
+                                    app.set_message(format!("Volume: {}%", new_vol), true);
+                                }
+                                KeyCode::Char('0') => {
+                                    app.playback.tx.send(PlaybackCommand::ToggleMute).ok();
+                                    if app.current_volume > 0.0 {
+                                        app.set_message("Volume: Muted".to_string(), true);
+                                    } else {
+                                        let vol = (app.current_volume * 100.0) as i32;
+                                        app.set_message(format!("Volume: {}%", vol), true);
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    app.playback.tx.send(PlaybackCommand::SkipForward(5)).ok();
+                                    app.set_message("+5 seconds".to_string(), false);
+                                }
+                                KeyCode::Left => {
+                                    app.playback.tx.send(PlaybackCommand::SkipBackward(5)).ok();
+                                    app.set_message("-5 seconds".to_string(), false);
+                                }
+                                KeyCode::Char('f') => {
+                                    app.playback.tx.send(PlaybackCommand::SkipForward(30)).ok();
+                                    app.set_message("+30 seconds".to_string(), false);
+                                }
+                                KeyCode::Char('b') => {
+                                    app.playback.tx.send(PlaybackCommand::SkipBackward(30)).ok();
+                                    app.set_message("-30 seconds".to_string(), false);
+                                }
+                                _ => {}
                             }
-                            KeyCode::Right => {
-                                app.playback.tx.send(PlaybackCommand::SkipForward(5)).ok();
-                                app.set_message("+5 seconds".to_string(), false);
-                            }
-                            KeyCode::Left => {
-                                app.playback.tx.send(PlaybackCommand::SkipBackward(5)).ok();
-                                app.set_message("-5 seconds".to_string(), false);
-                            }
-                            KeyCode::Char('f') => {
-                                app.playback.tx.send(PlaybackCommand::SkipForward(30)).ok();
-                                app.set_message("+30 seconds".to_string(), false);
-                            }
-                            KeyCode::Char('b') => {
-                                app.playback.tx.send(PlaybackCommand::SkipBackward(30)).ok();
-                                app.set_message("-30 seconds".to_string(), false);
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -394,7 +419,11 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         ])
         .split(main_chunks[1]);
 
-    let title = Paragraph::new("RustPlayer v0.1.0")
+    let focus_indicator = match app.focused_panel {
+        FocusPanel::Library => "[Library]",
+        FocusPanel::Devices => "[Devices]",
+    };
+    let title = Paragraph::new(format!("RustPlayer v0.1.0 {}", focus_indicator))
         .alignment(Alignment::Center)
         .style(Style::default().fg(Color::Cyan).bold());
     f.render_widget(title, left_chunks[0]);
@@ -649,6 +678,8 @@ fn draw_status_bar(f: &mut Frame, _app: &App, area: Rect) {
         Span::raw("Pause "),
         Span::styled("Arrows", Style::default().fg(Color::Yellow).bold()),
         Span::raw("Seek "),
+        Span::styled("d", Style::default().fg(Color::Magenta).bold()),
+        Span::raw("Devices "),
         Span::styled("?", Style::default().fg(Color::White).bold()),
         Span::raw("Help "),
         Span::styled("q", Style::default().fg(Color::Red).bold()),
@@ -675,20 +706,22 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Navigation", Style::default().fg(Color::Yellow)),
+            Span::styled("Library (Default)", Style::default().fg(Color::Yellow)),
         ]),
         Line::from("  j/k or Up/Down  - Navigate library"),
         Line::from("  J/K             - Navigate queue"),
+        Line::from("  Enter           - Play selected track"),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Layout", Style::default().fg(Color::Yellow)),
+            Span::styled("Device Mode (press d)", Style::default().fg(Color::Magenta)),
         ]),
-        Line::from("  Left: Library | Right: Info/History/Queue"),
+        Line::from("  j/k or Up/Down  - Navigate devices"),
+        Line::from("  Enter           - Select device"),
+        Line::from("  Esc             - Close device list"),
         Line::from(""),
         Line::from(vec![
             Span::styled("Playback", Style::default().fg(Color::Yellow)),
         ]),
-        Line::from("  Enter           - Play selected track"),
         Line::from("  Space           - Pause playback"),
         Line::from("  r               - Resume playback"),
         Line::from("  n               - Next track"),
@@ -703,13 +736,6 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         Line::from("  +/=             - Volume up"),
         Line::from("  -               - Volume down"),
         Line::from("  0               - Toggle mute"),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Device", Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from("  d               - Toggle device list"),
-        Line::from("  J/K             - Navigate devices"),
-        Line::from("  D               - Select device"),
         Line::from(""),
         Line::from(vec![
             Span::styled("Other", Style::default().fg(Color::Yellow)),
@@ -756,7 +782,7 @@ fn draw_device_popup(f: &mut Frame, app: &mut App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" Audio Devices ({}) ", app.devices.len()))
-                .border_style(Style::default().fg(Color::Blue)),
+                .border_style(Style::default().fg(Color::Magenta)),
         )
         .highlight_style(
             Style::default()
