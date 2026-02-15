@@ -46,9 +46,9 @@ async fn main() -> Result<()> {
     println!("Scanning: {} | Quality: {} | SoundCloud: {}", scan_path, quality, soundcloud_enabled);
 
     let mut core = Core::new();
-    core.scan_path(scan_path).await?;
+    core.add_scan_path(scan_path).await?;
 
-    let playback_handle = playback::start_playback_thread(core.clone());
+    let playback_handle = playback::start_audio_thread(core.clone());
 
     ui::run_ui(core, playback_handle).await?;
 
