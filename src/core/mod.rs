@@ -11,6 +11,7 @@ pub struct Core {
     pub current: Arc<Mutex<Option<usize>>>,
     pub recently_played: Arc<Mutex<Vec<usize>>>,
     pub soundcloud_enabled: Arc<Mutex<bool>>,
+    pub scan_paths: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl Core {
@@ -21,15 +22,66 @@ impl Core {
             current: Arc::new(Mutex::new(None)),
             recently_played: Arc::new(Mutex::new(Vec::new())),
             soundcloud_enabled: Arc::new(Mutex::new(false)),
+            scan_paths: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub async fn scan_path(&mut self, path: &str) -> anyhow::Result<()> {
+    pub async fn add_scan_path(&mut self, path: &str) -> anyhow::Result<usize> {
         let p = PathBuf::from(path);
+        if !p.exists() || !p.is_dir() {
+            return Err(anyhow::anyhow!("Path does not exist or is not a directory"));
+        }
+        
+        let mut paths = self.scan_paths.lock().unwrap();
+        if paths.contains(&p) {
+            return Err(anyhow::anyhow!("Path already added"));
+        }
+        
         let found = crate::sources::local::scan_dir(&p).await?;
+        let count = found.len();
+        
         let mut tracks = self.tracks.lock().unwrap();
-        *tracks = found;
+        tracks.extend(found);
+        paths.push(p);
+        
+        Ok(count)
+    }
+    
+    pub fn remove_scan_path(&mut self, index: usize) -> anyhow::Result<()> {
+        let mut paths = self.scan_paths.lock().unwrap();
+        if index >= paths.len() {
+            return Err(anyhow::anyhow!("Invalid index"));
+        }
+        
+        let removed_path = paths.remove(index);
+        drop(paths);
+        
+        let mut tracks = self.tracks.lock().unwrap();
+        tracks.retain(|t| {
+            if let Some(ref path) = t.path {
+                !path.starts_with(&removed_path)
+            } else {
+                true
+            }
+        });
+        
         Ok(())
+    }
+    
+    pub async fn rescan_all(&mut self) -> anyhow::Result<usize> {
+        let paths: Vec<PathBuf> = self.scan_paths.lock().unwrap().clone();
+        let mut total = 0;
+        
+        let mut tracks = self.tracks.lock().unwrap();
+        tracks.clear();
+        
+        for path in paths {
+            let found = crate::sources::local::scan_dir(&path).await?;
+            total += found.len();
+            tracks.extend(found);
+        }
+        
+        Ok(total)
     }
 
     pub fn enqueue(&self, idx: usize) {

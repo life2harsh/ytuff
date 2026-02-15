@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 pub enum FocusPanel {
     Library,
     Devices,
+    Folders,
 }
 
 pub struct App {
@@ -28,13 +29,22 @@ pub struct App {
     pub library_state: ListState,
     pub queue_state: ListState,
     pub device_state: ListState,
+    pub folder_state: ListState,
     pub devices: Vec<(String, bool)>,
     pub focused_panel: FocusPanel,
     pub show_help: bool,
     pub show_devices: bool,
-    pub message: Option<(String, Instant, bool)>,
+    pub show_folders: bool,
+    pub show_visualizer: bool,
+    pub search_mode: bool,
+    pub search_query: String,
+    pub search_results: Vec<usize>,
+    pub message: Option<(String, Instant, bool, bool)>,
     pub current_volume: f32,
+    pub is_muted: bool,
+    pub unmuted_volume: f32,
     pub volume_notification_time: Option<Instant>,
+    pub visualizer_data: Vec<f32>,
 }
 
 impl App {
@@ -48,19 +58,31 @@ impl App {
         let mut device_state = ListState::default();
         device_state.select(Some(0));
 
+        let mut folder_state = ListState::default();
+        folder_state.select(Some(0));
+
         App {
             core,
             playback,
             library_state,
             queue_state,
             device_state,
+            folder_state,
             devices: Vec::new(),
             focused_panel: FocusPanel::Library,
             show_help: false,
             show_devices: false,
+            show_folders: false,
+            show_visualizer: false,
+            search_mode: false,
+            search_query: String::new(),
+            search_results: Vec::new(),
             message: None,
             current_volume: 1.0,
+            is_muted: false,
+            unmuted_volume: 1.0,
             volume_notification_time: None,
+            visualizer_data: vec![0.0; 32],
         }
     }
 
@@ -155,6 +177,7 @@ impl App {
     pub fn play_selected(&mut self) {
         if let Some(idx) = self.library_state.selected() {
             self.core.enqueue(idx);
+            self.core.add_to_history(idx);
             self.playback.tx.send(PlaybackCommand::PlayIndex(idx)).ok();
         }
     }
@@ -183,15 +206,21 @@ impl App {
     }
 
     pub fn set_message(&mut self, msg: String, is_volume: bool) {
-        self.message = Some((msg, Instant::now(), is_volume));
-        if is_volume {
+        self.set_message_instant(msg, is_volume, false);
+    }
+    
+    pub fn set_message_instant(&mut self, msg: String, is_volume: bool, is_instant: bool) {
+        self.message = Some((msg, Instant::now(), is_volume, is_instant));
+        if is_volume && !is_instant {
             self.volume_notification_time = Some(Instant::now());
         }
     }
 
     pub fn clear_expired_message(&mut self) {
-        if let Some((_, timestamp, is_volume)) = self.message {
-            let delay = if is_volume {
+        if let Some((_, timestamp, is_volume, is_instant)) = self.message {
+            let delay = if is_instant {
+                Duration::from_secs(2)
+            } else if is_volume {
                 Duration::from_secs(4)
             } else {
                 Duration::from_secs(3)
@@ -202,12 +231,16 @@ impl App {
         }
     }
 
-    pub fn should_show_volume_notification(&self) -> bool {
-        if let Some(time) = self.volume_notification_time {
-            time.elapsed() >= Duration::from_secs(1)
-        } else {
-            false
+    pub fn should_show_notification(&self) -> bool {
+        if let Some((_, _, is_volume, is_instant)) = self.message {
+            if is_instant {
+                return true;
+            }
+            if let Some(time) = self.volume_notification_time {
+                return time.elapsed() >= Duration::from_secs(1);
+            }
         }
+        false
     }
 
     pub fn toggle_devices(&mut self) {
@@ -223,6 +256,103 @@ impl App {
     pub fn close_devices(&mut self) {
         self.show_devices = false;
         self.focused_panel = FocusPanel::Library;
+    }
+
+    pub fn toggle_folders(&mut self) {
+        self.show_folders = !self.show_folders;
+        if self.show_folders {
+            self.focused_panel = FocusPanel::Folders;
+        } else {
+            self.focused_panel = FocusPanel::Library;
+        }
+    }
+
+    pub fn close_folders(&mut self) {
+        self.show_folders = false;
+        self.focused_panel = FocusPanel::Library;
+    }
+
+    pub fn next_folder_item(&mut self) {
+        let paths = self.core.scan_paths.lock().unwrap();
+        let i = match self.folder_state.selected() {
+            Some(i) => {
+                if i >= paths.len().saturating_sub(1) {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.folder_state.select(Some(i));
+    }
+
+    pub fn previous_folder_item(&mut self) {
+        let paths = self.core.scan_paths.lock().unwrap();
+        let i = match self.folder_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    paths.len().saturating_sub(1)
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.folder_state.select(Some(i));
+    }
+
+    pub fn toggle_search(&mut self) {
+        self.search_mode = !self.search_mode;
+        if !self.search_mode {
+            self.search_query.clear();
+            self.search_results.clear();
+        }
+    }
+
+    pub fn execute_search(&mut self) {
+        if self.search_query.is_empty() {
+            self.search_results.clear();
+            return;
+        }
+
+        let query_lower = self.search_query.to_lowercase();
+        
+        let results: Vec<usize> = {
+            let tracks = self.core.tracks.lock().unwrap();
+            tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| {
+                    t.title.to_lowercase().contains(&query_lower)
+                        || t.artist
+                            .as_ref()
+                            .map(|a| a.to_lowercase().contains(&query_lower))
+                            .unwrap_or(false)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        
+        self.search_results = results;
+        self.search_mode = false;
+        
+        let msg = if self.search_results.is_empty() {
+            "No results found".to_string()
+        } else {
+            format!("{} results", self.search_results.len())
+        };
+        self.set_message(msg, false);
+    }
+
+    pub fn play_search_result(&mut self) {
+        if let Some(pos) = self.library_state.selected() {
+            if let Some(&track_idx) = self.search_results.get(pos) {
+                self.core.enqueue(track_idx);
+                self.core.add_to_history(track_idx);
+                self.playback.tx.send(PlaybackCommand::PlayIndex(track_idx)).ok();
+            }
+        }
     }
 }
 
@@ -263,6 +393,12 @@ pub async fn run_ui(core: Core, playback: PlaybackHandle) -> anyhow::Result<()> 
             }
         }
 
+        if app.show_visualizer {
+            while let Ok(data) = app.playback.visualizer_rx.try_recv() {
+                app.visualizer_data = data;
+            }
+        }
+
         terminal.draw(|f| draw_ui(f, &mut app))?;
 
         if let Ok(ev) = rx.recv_timeout(Duration::from_millis(50)) {
@@ -276,7 +412,7 @@ pub async fn run_ui(core: Core, playback: PlaybackHandle) -> anyhow::Result<()> 
                                 }
                                 _ => {}
                             }
-                        } else if app.show_devices {
+                         } else if app.show_devices {
                             match key.code {
                                 KeyCode::Esc => {
                                     app.close_devices();
@@ -297,6 +433,49 @@ pub async fn run_ui(core: Core, playback: PlaybackHandle) -> anyhow::Result<()> 
                                 }
                                 KeyCode::Char('d') => {
                                     app.toggle_devices();
+                                }
+                                _ => {}
+                            }
+                        } else if app.show_folders {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.close_folders();
+                                }
+                                KeyCode::Char('q') => {
+                                    app.playback.tx.send(PlaybackCommand::Quit).ok();
+                                    break;
+                                }
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    app.next_folder_item();
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    app.previous_folder_item();
+                                }
+                                KeyCode::Char('r') => {
+                                }
+                                KeyCode::Char('d') => {
+                                    if let Some(idx) = app.folder_state.selected() {
+                                        let _ = app.core.remove_scan_path(idx);
+                                    }
+                                }
+                                KeyCode::Char('F') => {
+                                    app.close_folders();
+                                }
+                                _ => {}
+                            }
+                        } else if app.search_mode {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.toggle_search();
+                                }
+                                KeyCode::Enter => {
+                                    app.execute_search();
+                                }
+                                KeyCode::Char(c) => {
+                                    app.search_query.push(c);
+                                }
+                                KeyCode::Backspace => {
+                                    app.search_query.pop();
                                 }
                                 _ => {}
                             }
@@ -323,6 +502,10 @@ pub async fn run_ui(core: Core, playback: PlaybackHandle) -> anyhow::Result<()> 
                                 }
                                 KeyCode::Char('d') => {
                                     app.toggle_devices();
+                                }
+                                KeyCode::Char('v') => {
+                                    app.show_visualizer = !app.show_visualizer;
+                                    app.playback.tx.send(PlaybackCommand::ToggleVisualizer).ok();
                                 }
                                 KeyCode::Char('a') => app.add_to_queue(),
                                 KeyCode::Enter => {
@@ -352,11 +535,16 @@ pub async fn run_ui(core: Core, playback: PlaybackHandle) -> anyhow::Result<()> 
                                 }
                                 KeyCode::Char('0') => {
                                     app.playback.tx.send(PlaybackCommand::ToggleMute).ok();
-                                    if app.current_volume > 0.0 {
-                                        app.set_message("Volume: Muted".to_string(), true);
-                                    } else {
+                                    if app.is_muted {
+                                        app.is_muted = false;
+                                        app.current_volume = app.unmuted_volume;
                                         let vol = (app.current_volume * 100.0) as i32;
-                                        app.set_message(format!("Volume: {}%", vol), true);
+                                        app.set_message_instant(format!("Volume: {}%", vol), true, true);
+                                    } else {
+                                        app.unmuted_volume = app.current_volume;
+                                        app.is_muted = true;
+                                        app.current_volume = 0.0;
+                                        app.set_message_instant("Volume: Muted".to_string(), true, true);
                                     }
                                 }
                                 KeyCode::Right => {
@@ -367,9 +555,11 @@ pub async fn run_ui(core: Core, playback: PlaybackHandle) -> anyhow::Result<()> 
                                     app.playback.tx.send(PlaybackCommand::SkipBackward(5)).ok();
                                     app.set_message("-5 seconds".to_string(), false);
                                 }
-                                KeyCode::Char('f') => {
-                                    app.playback.tx.send(PlaybackCommand::SkipForward(30)).ok();
-                                    app.set_message("+30 seconds".to_string(), false);
+                                KeyCode::Char('F') => {
+                                    app.toggle_folders();
+                                }
+                                KeyCode::Char('/') => {
+                                    app.toggle_search();
                                 }
                                 KeyCode::Char('b') => {
                                     app.playback.tx.send(PlaybackCommand::SkipBackward(30)).ok();
@@ -422,8 +612,14 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     let focus_indicator = match app.focused_panel {
         FocusPanel::Library => "[Library]",
         FocusPanel::Devices => "[Devices]",
+        FocusPanel::Folders => "[Folders]",
     };
-    let title = Paragraph::new(format!("RustPlayer v0.1.0 {}", focus_indicator))
+    let search_indicator = if !app.search_query.is_empty() {
+        format!(" [Search: {}]", app.search_query)
+    } else {
+        String::new()
+    };
+    let title = Paragraph::new(format!("RustPlayer v0.1.0 {}{}", focus_indicator, search_indicator))
         .alignment(Alignment::Center)
         .style(Style::default().fg(Color::Cyan).bold());
     f.render_widget(title, left_chunks[0]);
@@ -432,8 +628,14 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     draw_status_bar(f, app, left_chunks[2]);
 
     draw_info_panel(f, app, right_chunks[0]);
-    draw_recently_played(f, app, right_chunks[1]);
-    draw_queue(f, app, right_chunks[2]);
+    
+    if app.show_visualizer {
+        draw_visualizer(f, app, right_chunks[1]);
+        draw_queue(f, app, right_chunks[2]);
+    } else {
+        draw_recently_played(f, app, right_chunks[1]);
+        draw_queue(f, app, right_chunks[2]);
+    }
 
     if app.show_help {
         draw_help_popup(f, size);
@@ -443,8 +645,16 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         draw_device_popup(f, app, size);
     }
 
-    if let Some((msg, _, is_volume)) = &app.message {
-        if !is_volume || app.should_show_volume_notification() {
+    if app.show_folders {
+        draw_folder_popup(f, app, size);
+    }
+
+    if app.search_mode {
+        draw_search_bar(f, app, size);
+    }
+
+    if let Some((msg, _, is_volume, is_instant)) = &app.message {
+        if *is_instant || !is_volume || app.should_show_notification() {
             draw_notification(f, size, msg.clone());
         }
     }
@@ -589,15 +799,42 @@ fn draw_info_panel(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled("Artist: ", Style::default().fg(Color::Cyan)),
                 Span::raw(track.artist.clone().unwrap_or_else(|| "Unknown".to_string())),
             ]));
-            lines.push(Line::from(vec![
-                Span::styled("Type:   ", Style::default().fg(Color::Magenta)),
-                Span::raw(format!("{:?}", track.track_type)),
-            ]));
         } else {
             lines.push(Line::from("Nothing playing"));
         }
     } else {
         lines.push(Line::from("Nothing playing"));
+    }
+
+    lines.push(Line::from(""));
+
+    let position = app.playback.position_rx.lock().unwrap();
+    if let Some((current, total, is_playing)) = *position {
+        let curr_min = current / 60;
+        let curr_sec = current % 60;
+        let tot_min = total / 60;
+        let tot_sec = total % 60;
+        let time_str = format!(
+            "{:02}:{:02} / {:02}:{:02}",
+            curr_min, curr_sec, tot_min, tot_sec
+        );
+        let status = if is_playing { ">" } else { "||" };
+        lines.push(Line::from(vec![
+            Span::styled("Progress: ", Style::default().fg(Color::Blue)),
+            Span::raw(format!("{} {}", status, time_str)),
+        ]));
+        
+        let ratio = if total > 0 {
+            (current as f64 / total as f64).min(1.0)
+        } else {
+            0.0
+        };
+        let filled = (ratio * 20.0) as usize;
+        let empty = 20 - filled;
+        let progress_bar = "█".repeat(filled) + &"░".repeat(empty);
+        lines.push(Line::from(vec![
+            Span::raw(progress_bar),
+        ]));
     }
 
     lines.push(Line::from(""));
@@ -621,43 +858,6 @@ fn draw_info_panel(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(vol_text, Style::default().fg(vol_color)),
     ]));
 
-    if let Some((name, _)) = app.devices.iter().find(|(_, is_current)| *is_current) {
-        lines.push(Line::from(vec![
-            Span::styled("Device: ", Style::default().fg(Color::Blue)),
-            Span::raw(name),
-        ]));
-    }
-
-    lines.push(Line::from(""));
-
-    let position = app.playback.position_rx.lock().unwrap();
-    if let Some((current, total, is_playing)) = *position {
-        let ratio = if total > 0 {
-            (current as f64 / total as f64).min(1.0)
-        } else {
-            0.0
-        };
-        let curr_min = current / 60;
-        let curr_sec = current % 60;
-        let tot_min = total / 60;
-        let tot_sec = total % 60;
-        let time_str = format!(
-            "{:02}:{:02} / {:02}:{:02}",
-            curr_min, curr_sec, tot_min, tot_sec
-        );
-        let status = if is_playing { ">" } else { "||" };
-        lines.push(Line::from(vec![
-            Span::styled("Progress: ", Style::default().fg(Color::Blue)),
-            Span::raw(format!("{} {}", status, time_str)),
-        ]));
-
-        let progress_bar = "█".repeat((ratio * 20.0) as usize)
-            + &"░".repeat(20 - (ratio * 20.0) as usize);
-        lines.push(Line::from(vec![
-            Span::raw(progress_bar),
-        ]));
-    }
-
     let info_panel = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
@@ -678,6 +878,8 @@ fn draw_status_bar(f: &mut Frame, _app: &App, area: Rect) {
         Span::raw("Pause "),
         Span::styled("Arrows", Style::default().fg(Color::Yellow).bold()),
         Span::raw("Seek "),
+        Span::styled("v", Style::default().fg(Color::Green).bold()),
+        Span::raw("Vis "),
         Span::styled("d", Style::default().fg(Color::Magenta).bold()),
         Span::raw("Devices "),
         Span::styled("?", Style::default().fg(Color::White).bold()),
@@ -738,11 +940,31 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         Line::from("  0               - Toggle mute"),
         Line::from(""),
         Line::from(vec![
+            Span::styled("Visualizer", Style::default().fg(Color::Green)),
+        ]),
+        Line::from("  v               - Toggle visualizer"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Folders", Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from("  F               - Toggle folder browser"),
+        Line::from("  j/k             - Navigate folders"),
+        Line::from("  d               - Remove selected folder"),
+        Line::from("  r               - Rescan all folders"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Search", Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from("  /               - Enter search mode"),
+        Line::from("  Enter           - Execute search"),
+        Line::from("  Esc             - Clear search"),
+        Line::from(""),
+        Line::from(vec![
             Span::styled("Other", Style::default().fg(Color::Yellow)),
         ]),
         Line::from("  ?/h             - Toggle this help"),
         Line::from("  q               - Quit"),
-        Line::from("  Esc             - Close help/device"),
+        Line::from("  Esc             - Close popup"),
     ];
 
     let help_paragraph = Paragraph::new(Text::from(help_text))
@@ -818,6 +1040,79 @@ fn draw_notification(f: &mut Frame, area: Rect, message: String) {
     f.render_widget(msg, notif_area);
 }
 
+fn draw_visualizer(f: &mut Frame, app: &App, area: Rect) {
+    let num_bars = app.visualizer_data.len();
+    let available_width = area.width.saturating_sub(4) as usize;
+    let available_height = area.height.saturating_sub(2) as usize;
+    
+    let square_width = 2usize;
+    let gap = 1usize;
+    let bar_spacing = square_width + gap;
+    
+    let max_display_bars = (available_width / bar_spacing) + 1;
+    let display_bars = max_display_bars.min(num_bars);
+    
+    let bar_step = num_bars / display_bars.max(1);
+    
+    let total_width = display_bars * bar_spacing;
+    let left_padding = (available_width.saturating_sub(total_width)) / 2;
+    
+    let mut lines = vec![];
+    
+    for row in 0..available_height {
+        let mut spans = vec![];
+        let row_from_top = available_height - 1 - row;
+        let threshold = row_from_top as f32 / available_height as f32;
+        
+        if left_padding > 0 {
+            spans.push(Span::raw(" ".repeat(left_padding)));
+        }
+        
+        for i in 0..display_bars {
+            let data_idx = (i * bar_step).min(num_bars - 1);
+            let value = app.visualizer_data.get(data_idx).copied().unwrap_or(0.0);
+            
+            let is_filled = value >= threshold;
+            
+            if is_filled {
+                let base_color = if i < display_bars / 4 {
+                    Color::Red
+                } else if i < display_bars / 2 {
+                    Color::Yellow
+                } else if i < (display_bars * 3) / 4 {
+                    Color::Green
+                } else {
+                    Color::Cyan
+                };
+                
+                let square = Span::styled(
+                    "██",
+                    Style::default().fg(base_color),
+                );
+                spans.push(square);
+            } else {
+                spans.push(Span::raw("  "));
+            }
+            
+            if i < display_bars - 1 {
+                spans.push(Span::raw(" "));
+            }
+        }
+        
+        lines.push(Line::from(spans));
+    }
+
+    let visualizer = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Visualizer ")
+                .border_style(Style::default().fg(Color::Green)),
+        );
+
+    f.render_widget(visualizer, area);
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -848,4 +1143,51 @@ fn top_right_rect(width: u16, height: u16, r: Rect) -> Rect {
         width: width.min(r.width),
         height: height.min(r.height),
     }
+}
+
+fn draw_folder_popup(f: &mut Frame, app: &mut App, area: Rect) {
+    let popup_area = centered_rect(50, 60, area);
+
+    let paths = app.core.scan_paths.lock().unwrap();
+    let items: Vec<ListItem> = paths
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            let display_path = path.to_string_lossy().to_string();
+            let content = format!("{:2}. {}", idx + 1, display_path);
+            ListItem::new(content)
+        })
+        .collect();
+
+    let folder_list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Folders ({}) ", paths.len()))
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+
+    f.render_widget(Clear, popup_area);
+    f.render_stateful_widget(folder_list, popup_area, &mut app.folder_state);
+}
+
+fn draw_search_bar(f: &mut Frame, app: &App, area: Rect) {
+    let search_area = Rect {
+        x: 1,
+        y: 0,
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+
+    let search_text = format!("Search: {}", app.search_query);
+    let search_widget = Paragraph::new(search_text)
+        .style(Style::default().fg(Color::Yellow).bold());
+
+    f.render_widget(search_widget, search_area);
 }
