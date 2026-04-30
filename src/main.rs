@@ -1,3 +1,4 @@
+mod auth;
 mod appdata;
 mod core;
 mod daemon;
@@ -10,6 +11,7 @@ mod sources;
 mod ui;
 
 use crate::appdata::{AppConfig, AppPaths};
+use crate::auth::youtube_login_window;
 use crate::core::track::Track;
 use crate::core::Core;
 use crate::daemon::{send_request, RpcRequest};
@@ -20,6 +22,8 @@ use crate::sources::soundcloud::{Ql, SoundCloudClient};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use serde_json::Value;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -28,7 +32,7 @@ use std::sync::{Arc, Mutex};
     name = "rustplayer",
     version,
     about = "A high-performance terminal music player with YouTube streaming",
-    after_help = "Auth note:\n  Browser-based YouTube OAuth login is not built in.\n  Metrolist-style cookie login is supported through\n  'rustplayer auth cookie-file <cookies.txt>' or\n  'rustplayer auth cookie-header \"SID=...; SAPISID=...\"'.\n\nExamples:\n  rustplayer auth show\n  rustplayer status\n  rustplayer play \"never gonna give you up\"\n  rustplayer download \"https://music.youtube.com/watch?v=lYBUbBu4W08\" --format mp3\n  rustplayer playlist create mix"
+    after_help = "Auth note:\n  On Windows, RustPlayer can open a dedicated YouTube Music login window with\n  'rustplayer auth login'.\n  Manual cookie login is still supported through\n  'rustplayer auth cookie-file <cookies.txt>' or\n  'rustplayer auth cookie-header \"SID=...; SAPISID=...\"'.\n  You can also import ytmusicapi headers.json via\n  'rustplayer auth headers-file <headers.json>'.\n\nExamples:\n  rustplayer auth login\n  rustplayer auth show\n  rustplayer auth headers-file headers.json\n  rustplayer status\n  rustplayer play \"never gonna give you up\"\n  rustplayer download \"https://music.youtube.com/watch?v=lYBUbBu4W08\" --format mp3\n  rustplayer playlist create mix"
 )]
 struct Cli {
     #[arg(short = 'p', long = "path", global = true, value_name = "DIR")]
@@ -146,8 +150,10 @@ enum LibraryCommand {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommand {
+    Login,
     CookieFile { path: PathBuf },
     CookieHeader { header: String },
+    HeadersFile { path: PathBuf },
     Clear,
     Show,
 }
@@ -310,6 +316,7 @@ impl Runtime {
     fn make_client(&self) -> Result<SoundCloudClient> {
         let mut client = SoundCloudClient::new(Ql::parse(&self.cfg.quality));
         client.set_cookie_header(self.cfg.cookie_header()?);
+        client.set_auth_user(self.cfg.youtube_auth_user.clone());
         Ok(client)
     }
 
@@ -332,12 +339,19 @@ impl Runtime {
 
 fn run_tui(runtime: &Runtime) -> Result<()> {
     let core = runtime.build_core();
-    let playback = playback::start_audio_thread(
-        core.clone(),
-        Arc::new(Mutex::new(runtime.make_client()?)),
-        runtime.cfg.autoplay,
-    );
-    ui::run_ui(core, playback, Arc::new(Mutex::new(runtime.make_client()?)))
+    let ui_client = Arc::new(Mutex::new(runtime.make_client()?));
+    let playback_client = Arc::new(Mutex::new(runtime.make_client()?));
+    let shared_cfg = Arc::new(Mutex::new(runtime.cfg.clone()));
+    let playback =
+        playback::start_audio_thread(core.clone(), playback_client.clone(), runtime.cfg.autoplay);
+    ui::run_ui(
+        core,
+        playback,
+        ui_client,
+        playback_client,
+        runtime.paths.clone(),
+        shared_cfg,
+    )
 }
 
 fn show_status(runtime: &Runtime, json: bool) -> Result<()> {
@@ -612,9 +626,30 @@ fn library_command(runtime: &mut Runtime, command: &LibraryCommand, json: bool) 
 
 fn auth_command(runtime: &mut Runtime, command: &AuthCommand, json: bool) -> Result<bool> {
     match command {
+        AuthCommand::Login => {
+            println!("opening the YouTube Music login window...");
+            let session = youtube_login_window(&runtime.paths)?;
+
+            let mut client = SoundCloudClient::new(Ql::parse(&runtime.cfg.quality));
+            client.set_cookie_header(Some(session.cookie_header.clone()));
+            client.set_auth_user(session.auth_user.clone());
+            let state = client.login()?;
+
+            runtime.cfg.youtube_cookie_header = Some(session.cookie_header);
+            runtime.cfg.youtube_cookie_file = None;
+            runtime.cfg.youtube_auth_user = session.auth_user;
+            runtime.persist()?;
+
+            println!(
+                "signed in as {}",
+                state.name.unwrap_or_else(|| "unknown".to_string())
+            );
+            Ok(true)
+        }
         AuthCommand::CookieFile { path } => {
             runtime.cfg.youtube_cookie_file = Some(normalize_path(path)?);
             runtime.cfg.youtube_cookie_header = None;
+            runtime.cfg.youtube_auth_user = None;
             runtime.persist()?;
             println!("cookie file saved");
             Ok(true)
@@ -622,47 +657,84 @@ fn auth_command(runtime: &mut Runtime, command: &AuthCommand, json: bool) -> Res
         AuthCommand::CookieHeader { header } => {
             runtime.cfg.youtube_cookie_header = Some(header.trim().to_string());
             runtime.cfg.youtube_cookie_file = None;
+            runtime.cfg.youtube_auth_user = None;
             runtime.persist()?;
             println!("cookie header saved");
+            Ok(true)
+        }
+        AuthCommand::HeadersFile { path } => {
+            let path = normalize_path(path)?;
+            let (cookie, auth_user) = parse_headers_json(&path)?;
+            runtime.cfg.youtube_cookie_header = Some(cookie);
+            runtime.cfg.youtube_cookie_file = None;
+            runtime.cfg.youtube_auth_user = auth_user;
+            runtime.persist()?;
+            println!("headers file imported");
             Ok(true)
         }
         AuthCommand::Clear => {
             runtime.cfg.youtube_cookie_header = None;
             runtime.cfg.youtube_cookie_file = None;
+            runtime.cfg.youtube_auth_user = None;
             runtime.persist()?;
             println!("youtube auth cleared");
             Ok(true)
         }
         AuthCommand::Show => {
+            let configured_cookie_header = runtime
+                .cfg
+                .youtube_cookie_header
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty());
+            let effective_cookie_header = runtime.cfg.cookie_header()?;
+            let browser_cookie_fallback = runtime.cfg.youtube_cookie_file.is_none()
+                && !configured_cookie_header
+                && effective_cookie_header.is_some();
+            let effective_auth_user = effective_cookie_header
+                .as_ref()
+                .map(|_| runtime.cfg.youtube_auth_user.as_deref().unwrap_or("0").to_string());
             let state = runtime.make_client()?.state();
             let payload = serde_json::json!({
                 "cookie_file": runtime.cfg.youtube_cookie_file,
-                "cookie_header_configured": runtime.cfg.youtube_cookie_header.as_ref().is_some_and(|value| !value.trim().is_empty()),
+                "cookie_header_configured": configured_cookie_header,
+                "browser_cookie_fallback": browser_cookie_fallback,
+                "auth_user": runtime.cfg.youtube_auth_user,
+                "effective_auth_user": effective_auth_user,
                 "ready": state.ready,
                 "logged_in": state.user,
                 "account_name": state.name,
                 "message": state.msg,
             });
             print_json_or_text(&payload, json, || {
-                if state.user {
-                    return format!(
-                        "signed in as {}",
-                        state.name.unwrap_or_else(|| "unknown".to_string())
-                    );
-                }
-
                 let source = if let Some(path) = runtime.cfg.youtube_cookie_file.as_ref() {
                     format!("cookie file: {} (account not verified)", path.display())
-                } else if runtime
-                    .cfg
-                    .youtube_cookie_header
-                    .as_ref()
-                    .is_some_and(|value| !value.trim().is_empty())
-                {
-                    "cookie header: configured (account not verified)".to_string()
+                } else if configured_cookie_header {
+                    let auth_user = runtime
+                        .cfg
+                        .youtube_auth_user
+                        .as_deref()
+                        .unwrap_or("0");
+                    format!("cookie header: configured (auth user {auth_user})")
+                } else if browser_cookie_fallback {
+                    let auth_user = runtime
+                        .cfg
+                        .youtube_auth_user
+                        .as_deref()
+                        .unwrap_or("0");
+                    format!(
+                        "browser cookies: detected (auth user {auth_user}, browser/profile auto-picked)"
+                    )
                 } else {
                     "youtube auth: not configured".to_string()
                 };
+
+                if state.user {
+                    return format!(
+                        "signed in as {}\n{}",
+                        state.name.unwrap_or_else(|| "unknown".to_string()),
+                        source
+                    );
+                }
 
                 match state.msg {
                     Some(msg) if !msg.trim().is_empty() => format!("{source}\n{msg}"),
@@ -672,6 +744,39 @@ fn auth_command(runtime: &mut Runtime, command: &AuthCommand, json: bool) -> Res
             Ok(false)
         }
     }
+}
+
+fn parse_headers_json(path: &Path) -> Result<(String, Option<String>)> {
+    let txt = fs::read_to_string(path)
+        .with_context(|| format!("Could not read headers file {}", path.display()))?;
+    let json: Value = serde_json::from_str(&txt)
+        .with_context(|| format!("Could not parse headers file {}", path.display()))?;
+    let obj = json
+        .as_object()
+        .or_else(|| json.get("headers").and_then(Value::as_object))
+        .ok_or_else(|| anyhow!("Headers file must be a JSON object"))?;
+
+    let mut cookie: Option<String> = None;
+    let mut auth_user: Option<String> = None;
+    for (key, value) in obj {
+        let key = key.trim().to_ascii_lowercase();
+        if key == "cookie" {
+            cookie = value
+                .as_str()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+        } else if key == "x-goog-authuser" {
+            auth_user = match value {
+                Value::String(v) => Some(v.trim().to_string()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }
+            .filter(|v| !v.is_empty());
+        }
+    }
+
+    let cookie = cookie.ok_or_else(|| anyhow!("Headers file is missing a Cookie header"))?;
+    Ok((cookie, auth_user))
 }
 
 fn maybe_restart_daemon(runtime: &Runtime) -> Result<()> {

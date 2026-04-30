@@ -85,6 +85,24 @@ rustplayer --path "/path/to/music" --soundcloud
 | `j` / `k` or `↓` / `↑` | Navigate track list |
 | `q` | Exit application |
 
+### YouTube Music Auth (Optional)
+
+Personalized home, playlists, history, and recommendations use browser cookies. You can import
+cookies or a ytmusicapi-style headers file:
+
+```bash
+rustplayer auth cookie-file <cookies.txt>
+rustplayer auth cookie-header "SID=...; SAPISID=..."
+rustplayer auth headers-file <headers.json>
+```
+
+Artwork inline rendering defaults to ANSI blocks. If you want to try inline wimg rendering:
+
+```bash
+RUSTPLAYER_ART=wimg
+RUSTPLAYER_WIMG_INLINE=1
+```
+
 **Track Indicators:**
 - `L` = Local file
 - `C` = Cloud source (SoundCloud)

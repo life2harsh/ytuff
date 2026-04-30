@@ -23,6 +23,32 @@ rustplayer --path "C:\Music" --quality high
 ```
 This launches the player scanning your Music folder with high-quality audio.
 
+### YouTube Music Auth (Optional)
+
+Personalized home, playlists, history, and recommendations use browser cookies. You can import
+cookies or a ytmusicapi-style headers file:
+
+```bash
+rustplayer auth cookie-file <cookies.txt>
+rustplayer auth cookie-header "SID=...; SAPISID=..."
+rustplayer auth headers-file <headers.json>
+```
+
+### Artwork Rendering
+
+RustPlayer can render artwork inline in the artwork panel. Choose a renderer with:
+
+```bash
+RUSTPLAYER_ART=blocks   # ANSI blocks (default)
+RUSTPLAYER_ART=sixel    # Sixel-capable terminals
+RUSTPLAYER_ART=wimg     # Requires RUSTPLAYER_WIMG_INLINE=1
+RUSTPLAYER_ART=off       # Disable inline artwork
+```
+
+Use `RUSTPLAYER_SIXEL=1` to force sixel rendering on supported terminals.
+Inline wimg rendering is off by default because it does not support positioning.
+Set `RUSTPLAYER_WIMG_INLINE=1` to force it.
+
 ---
 
 ## Why Does It Exist? (The "Why")

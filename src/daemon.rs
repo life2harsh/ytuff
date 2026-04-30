@@ -359,5 +359,6 @@ fn start_runtime_monitor(state: Arc<SharedState>) {
 fn make_client(cfg: &AppConfig) -> Result<SoundCloudClient> {
     let mut client = SoundCloudClient::new(Ql::parse(&cfg.quality));
     client.set_cookie_header(cfg.cookie_header()?);
+    client.set_auth_user(cfg.youtube_auth_user.clone());
     Ok(client)
 }

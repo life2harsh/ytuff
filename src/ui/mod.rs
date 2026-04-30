@@ -1,6 +1,8 @@
+use crate::appdata::{AppConfig, AppPaths};
+use crate::auth::{youtube_login_window, AuthSession};
 use crate::core::track::{Acc, Track};
 use crate::core::Core;
-use crate::playback::{PlaybackCommand, PlaybackHandle};
+use crate::playback::{CollectionKind, PlaybackCommand, PlaybackHandle, RepeatMode};
 use crate::sources::soundcloud::{build_auth_link, ScState, SoundCloudClient};
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind};
 use ratatui::{
@@ -25,7 +27,8 @@ pub enum ScReq {
     Init,
     Home,
     Library,
-    Browse(String, String),
+    Browse(String, String, BrowseHint),
+    ResolveCollection(String, String, CollectionKind, CollectionAction),
     Search(String),
     Suggest(String),
     Login,
@@ -35,9 +38,29 @@ pub enum ScReq {
 
 enum ScEvt {
     State(ScState),
-    View(String, Result<Vec<Track>, String>),
+    View(String, ViewKind, Result<Vec<Track>, String>),
+    Collection(String, CollectionKind, CollectionAction, Result<Vec<Track>, String>),
     Suggest(String, Result<Vec<String>, String>),
     Art(String, Result<Vec<u8>, String>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BrowseHint {
+    Artist,
+    Playlist,
+    Album,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewKind {
+    Generic,
+    Collection(CollectionKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionAction {
+    Play,
+    Enqueue,
 }
 
 mod media;
@@ -81,12 +104,15 @@ pub struct App {
     lres_on: bool,
     sc_ids: Vec<String>,
     sc_title: String,
-    sc_stack: Vec<(String, Vec<String>)>,
+    sc_stack: Vec<(String, Vec<String>, ViewKind)>,
+    sc_view_kind: ViewKind,
     sc_busy: bool,
     sc_info: ScState,
     fld: Option<usize>,
     msg: Option<(String, Instant)>,
     autoplay: bool,
+    repeat_mode: RepeatMode,
+    shuffle_on: bool,
     vol: f32,
     mute: bool,
     old_vol: f32,
@@ -141,11 +167,14 @@ impl App {
             sc_ids: Vec::new(),
             sc_title: "YouTube".to_string(),
             sc_stack: Vec::new(),
+            sc_view_kind: ViewKind::Generic,
             sc_busy: false,
             sc_info: ScState::default(),
             fld: None,
             msg: None,
             autoplay: false,
+            repeat_mode: RepeatMode::Off,
+            shuffle_on: false,
             vol: 1.0,
             mute: false,
             old_vol: 1.0,
@@ -204,7 +233,51 @@ impl App {
         }
     }
 
+    fn collection_track_ids(&self) -> Option<Vec<String>> {
+        let ViewKind::Collection(_) = self.sc_view_kind else {
+            return None;
+        };
+        let ids = self
+            .sc_ids
+            .iter()
+            .filter(|id| {
+                self.core
+                    .track(id)
+                    .is_some_and(|track| track.is_playable_remote() && track.acc != Some(Acc::Block))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        (!ids.is_empty()).then_some(ids)
+    }
+
+    fn selected_collection_index(&self) -> Option<usize> {
+        let ids = self.collection_track_ids()?;
+        let selected_id = self.pick_id()?;
+        ids.iter().position(|id| id == &selected_id)
+    }
+
+    fn play_collection_ids(&mut self, ids: Vec<String>, start_index: usize, kind: CollectionKind) {
+        let _ = self.pb.tx.send(PlaybackCommand::PlayCollection {
+            ids,
+            start_index,
+            kind,
+        });
+    }
+
     fn play_sel(&mut self) {
+        if self.md == Mode::Sc {
+            if let (Some(kind), Some(ids), Some(start_index)) = (
+                match self.sc_view_kind {
+                    ViewKind::Collection(kind) => Some(kind),
+                    ViewKind::Generic => None,
+                },
+                self.collection_track_ids(),
+                self.selected_collection_index(),
+            ) {
+                self.play_collection_ids(ids, start_index, kind);
+                return;
+            }
+        }
         if let Some(id) = self.pick_id() {
             let _ = self.pb.tx.send(PlaybackCommand::PlayTrack(id));
         }
@@ -225,13 +298,70 @@ impl App {
     fn add_q(&mut self) {
         if let Some(track) = self.pick_track() {
             if track.is_remote_browse() {
-                self.note("open the playlist or album first");
+                self.note("use P to play or Q to queue this playlist or album");
                 return;
             }
             let id = track.id;
             self.core.enqueue(id);
             self.note("queued");
         }
+    }
+
+    fn play_collection_action(&mut self) {
+        if let Some(track) = self.pick_track() {
+            if track.is_remote_browse() {
+                if let Some(kind) = collection_kind_from_browse(&track) {
+                    self.sc_busy = true;
+                    let _ = self.sc.tx.send(ScReq::ResolveCollection(
+                        track.browse_id().unwrap_or_default().to_string(),
+                        track.title.clone(),
+                        kind,
+                        CollectionAction::Play,
+                    ));
+                } else {
+                    self.note("open the artist page first");
+                }
+                return;
+            }
+        }
+
+        let Some(kind) = self.current_collection_kind() else {
+            self.note("open a playlist or album first");
+            return;
+        };
+        let Some(ids) = self.collection_track_ids() else {
+            self.note("no playable tracks were found in this collection");
+            return;
+        };
+        self.play_collection_ids(ids, 0, kind);
+    }
+
+    fn queue_collection_action(&mut self) {
+        if let Some(track) = self.pick_track() {
+            if track.is_remote_browse() {
+                if let Some(kind) = collection_kind_from_browse(&track) {
+                    self.sc_busy = true;
+                    let _ = self.sc.tx.send(ScReq::ResolveCollection(
+                        track.browse_id().unwrap_or_default().to_string(),
+                        track.title.clone(),
+                        kind,
+                        CollectionAction::Enqueue,
+                    ));
+                } else {
+                    self.note("artists can be opened, but not queued as a collection");
+                }
+                return;
+            }
+        }
+
+        let Some(ids) = self.collection_track_ids() else {
+            self.note("open a playlist or album first");
+            return;
+        };
+        for id in ids {
+            self.core.enqueue(id);
+        }
+        self.note("collection queued");
     }
 
     fn pick_track(&self) -> Option<Track> {
@@ -508,17 +638,28 @@ impl App {
         self.img.mark();
     }
 
+    fn current_collection_kind(&self) -> Option<CollectionKind> {
+        match self.sc_view_kind {
+            ViewKind::Collection(kind) => Some(kind),
+            ViewKind::Generic => None,
+        }
+    }
+
     fn push_sc_view(&mut self) {
         if !self.sc_ids.is_empty() {
-            self.sc_stack
-                .push((self.sc_title.clone(), self.sc_ids.clone()));
+            self.sc_stack.push((
+                self.sc_title.clone(),
+                self.sc_ids.clone(),
+                self.sc_view_kind,
+            ));
         }
     }
 
     fn pop_sc_view(&mut self) {
-        if let Some((title, ids)) = self.sc_stack.pop() {
+        if let Some((title, ids, view_kind)) = self.sc_stack.pop() {
             self.sc_title = title;
             self.sc_ids = ids;
+            self.sc_view_kind = view_kind;
             self.sc_st.select(Some(0));
             self.img.mark();
         }
@@ -553,7 +694,37 @@ impl App {
         let _ = self
             .sc
             .tx
-            .send(ScReq::Browse(browse_id.to_string(), track.title.clone()));
+            .send(ScReq::Browse(
+                browse_id.to_string(),
+                track.title.clone(),
+                browse_hint_from_track(track),
+            ));
+    }
+}
+
+fn browse_hint_from_track(track: &Track) -> BrowseHint {
+    if track.is_artist_browse() {
+        BrowseHint::Artist
+    } else if track.is_album_browse() {
+        BrowseHint::Album
+    } else {
+        BrowseHint::Playlist
+    }
+}
+
+fn collection_kind_from_browse(track: &Track) -> Option<CollectionKind> {
+    match browse_hint_from_track(track) {
+        BrowseHint::Artist => None,
+        BrowseHint::Playlist => Some(CollectionKind::Playlist),
+        BrowseHint::Album => Some(CollectionKind::Album),
+    }
+}
+
+fn view_kind_from_browse_hint(hint: BrowseHint) -> ViewKind {
+    match hint {
+        BrowseHint::Playlist => ViewKind::Collection(CollectionKind::Playlist),
+        BrowseHint::Album => ViewKind::Collection(CollectionKind::Album),
+        BrowseHint::Artist => ViewKind::Generic,
     }
 }
 
@@ -561,6 +732,9 @@ pub fn run_ui(
     core: Core,
     pb: PlaybackHandle,
     sc_cli: Arc<Mutex<SoundCloudClient>>,
+    playback_sc_cli: Arc<Mutex<SoundCloudClient>>,
+    paths: AppPaths,
+    cfg: Arc<Mutex<AppConfig>>,
 ) -> anyhow::Result<()> {
     let out = io::stdout();
     crossterm::terminal::enable_raw_mode()?;
@@ -585,7 +759,7 @@ pub fn run_ui(
         }
     });
 
-    let sc = start_sc(sc_cli);
+    let sc = start_sc(sc_cli, playback_sc_cli, paths, cfg);
     let mut app = App::new(core, pb, sc);
     let _ = app.sc.tx.send(ScReq::Init);
     let _ = app.pb.tx.send(PlaybackCommand::ListDevices);
@@ -597,6 +771,12 @@ pub fn run_ui(
         }
         while let Ok(autoplay) = app.pb.autoplay_rx.try_recv() {
             app.autoplay = autoplay;
+        }
+        while let Ok(repeat_mode) = app.pb.repeat_rx.try_recv() {
+            app.repeat_mode = repeat_mode;
+        }
+        while let Ok(shuffle_on) = app.pb.shuffle_rx.try_recv() {
+            app.shuffle_on = shuffle_on;
         }
         while let Ok(vol) = app.pb.volume_rx.try_recv() {
             app.vol = vol;
@@ -616,13 +796,53 @@ pub fn run_ui(
                     }
                     app.sc_info = st;
                 }
-                ScEvt::View(title, res) => {
+                ScEvt::View(title, view_kind, res) => {
                     app.sc_busy = false;
                     match res {
                         Ok(list) => {
                             let count = list.len();
                             app.set_sc_view(title, list);
+                            app.sc_view_kind = view_kind;
                             app.note(format!("{} YouTube item(s)", count));
+                        }
+                        Err(e) => {
+                            app.sc_view_kind = ViewKind::Generic;
+                            app.note(e);
+                        }
+                    }
+                }
+                ScEvt::Collection(title, kind, action, res) => {
+                    app.sc_busy = false;
+                    match res {
+                        Ok(list) => {
+                            let ids = list
+                                .iter()
+                                .filter(|track| {
+                                    track.is_playable_remote() && track.acc != Some(Acc::Block)
+                                })
+                                .map(|track| track.id.clone())
+                                .collect::<Vec<_>>();
+                            app.core.put_tracks(list.clone());
+
+                            if ids.is_empty() {
+                                app.note("no playable tracks were found in that collection");
+                                continue;
+                            }
+
+                            match action {
+                                CollectionAction::Play => {
+                                    app.set_sc_view(title, list);
+                                    app.sc_view_kind = ViewKind::Collection(kind);
+                                    app.play_collection_ids(ids, 0, kind);
+                                    app.note("collection started");
+                                }
+                                CollectionAction::Enqueue => {
+                                    for id in ids {
+                                        app.core.enqueue(id);
+                                    }
+                                    app.note("collection queued");
+                                }
+                            }
                         }
                         Err(e) => app.note(e),
                     }
@@ -806,6 +1026,11 @@ pub fn run_ui(
                         }
                         KeyCode::Char('l') => {
                             if app.md == Mode::Sc {
+                                if app.sc_info.user {
+                                    app.note("signing out of YouTube");
+                                } else {
+                                    app.note("opening the YouTube login window");
+                                }
                                 app.sc_busy = true;
                                 let _ = app.sc.tx.send(if app.sc_info.user {
                                     ScReq::Logout
@@ -869,7 +1094,15 @@ pub fn run_ui(
                         KeyCode::Char('A') => {
                             let _ = app.pb.tx.send(PlaybackCommand::ToggleAutoplay);
                         }
+                        KeyCode::Char('R') => {
+                            let _ = app.pb.tx.send(PlaybackCommand::ToggleRepeat);
+                        }
+                        KeyCode::Char('z') => {
+                            let _ = app.pb.tx.send(PlaybackCommand::ToggleShuffle);
+                        }
                         KeyCode::Char('a') => app.add_q(),
+                        KeyCode::Char('P') => app.play_collection_action(),
+                        KeyCode::Char('Q') => app.queue_collection_action(),
                         KeyCode::Enter => app.activate_sel(),
                         KeyCode::Char('j') | KeyCode::Down => app.next_item(),
                         KeyCode::Char('k') | KeyCode::Up => app.prev_item(),
@@ -924,7 +1157,65 @@ pub fn run_ui(
     Ok(())
 }
 
-fn start_sc(sc: Arc<Mutex<SoundCloudClient>>) -> ScSrv {
+fn apply_auth_session(
+    clients: &[Arc<Mutex<SoundCloudClient>>],
+    cfg: &Arc<Mutex<AppConfig>>,
+    paths: &AppPaths,
+    session: AuthSession,
+) -> Result<ScState, String> {
+    let mut verified = clients
+        .first()
+        .ok_or_else(|| "No YouTube client is available".to_string())?
+        .lock()
+        .unwrap()
+        .clone();
+    verified.set_cookie_header(Some(session.cookie_header.clone()));
+    verified.set_auth_user(session.auth_user.clone());
+    let state = verified.login().map_err(|err| err.to_string())?;
+
+    {
+        let mut cfg = cfg.lock().unwrap();
+        cfg.youtube_cookie_header = Some(session.cookie_header);
+        cfg.youtube_cookie_file = None;
+        cfg.youtube_auth_user = session.auth_user;
+        cfg.save(paths).map_err(|err| err.to_string())?;
+    }
+
+    for client in clients {
+        *client.lock().unwrap() = verified.clone();
+    }
+    Ok(state)
+}
+
+fn clear_auth_session(
+    clients: &[Arc<Mutex<SoundCloudClient>>],
+    cfg: &Arc<Mutex<AppConfig>>,
+    paths: &AppPaths,
+) -> Result<ScState, String> {
+    {
+        let mut cfg = cfg.lock().unwrap();
+        cfg.youtube_cookie_header = None;
+        cfg.youtube_cookie_file = None;
+        cfg.youtube_auth_user = None;
+        cfg.save(paths).map_err(|err| err.to_string())?;
+    }
+
+    let first = clients
+        .first()
+        .ok_or_else(|| "No YouTube client is available".to_string())?;
+    let state = first.lock().unwrap().logout().map_err(|err| err.to_string())?;
+    for client in clients.iter().skip(1) {
+        let _ = client.lock().unwrap().logout();
+    }
+    Ok(state)
+}
+
+fn start_sc(
+    sc: Arc<Mutex<SoundCloudClient>>,
+    playback_sc: Arc<Mutex<SoundCloudClient>>,
+    paths: AppPaths,
+    cfg: Arc<Mutex<AppConfig>>,
+) -> ScSrv {
     let (tx, rx) = mpsc::channel::<ScReq>();
     let (etx, erx) = mpsc::channel::<ScEvt>();
     thread::spawn(move || {
@@ -935,7 +1226,7 @@ fn start_sc(sc: Arc<Mutex<SoundCloudClient>>) -> ScSrv {
                     let st = client.state();
                     let _ = etx.send(ScEvt::State(st));
                     let res = client.account_feed(28, 12).map_err(|e| e.to_string());
-                    let _ = etx.send(ScEvt::View("Home".to_string(), res));
+                    let _ = etx.send(ScEvt::View("Home".to_string(), ViewKind::Generic, res));
                 }
                 ScReq::Home => {
                     let res = sc
@@ -943,7 +1234,7 @@ fn start_sc(sc: Arc<Mutex<SoundCloudClient>>) -> ScSrv {
                         .unwrap()
                         .account_feed(28, 12)
                         .map_err(|e| e.to_string());
-                    let _ = etx.send(ScEvt::View("Home".to_string(), res));
+                    let _ = etx.send(ScEvt::View("Home".to_string(), ViewKind::Generic, res));
                 }
                 ScReq::Library => {
                     let res = sc
@@ -951,9 +1242,13 @@ fn start_sc(sc: Arc<Mutex<SoundCloudClient>>) -> ScSrv {
                         .unwrap()
                         .library_playlists(40)
                         .map_err(|e| e.to_string());
-                    let _ = etx.send(ScEvt::View("My Playlists".to_string(), res));
+                    let _ = etx.send(ScEvt::View(
+                        "My Playlists".to_string(),
+                        ViewKind::Generic,
+                        res,
+                    ));
                 }
-                ScReq::Browse(id, title) => {
+                ScReq::Browse(id, title, hint) => {
                     let res = sc
                         .lock()
                         .unwrap()
@@ -961,15 +1256,59 @@ fn start_sc(sc: Arc<Mutex<SoundCloudClient>>) -> ScSrv {
                         .map_err(|e| e.to_string());
                     match res {
                         Ok((resolved_title, items)) => {
+                            if items.is_empty() {
+                                let _ = etx.send(ScEvt::View(
+                                    title,
+                                    ViewKind::Generic,
+                                    Err("No playable items found".to_string()),
+                                ));
+                                continue;
+                            }
                             let view_title = if resolved_title.trim().is_empty() {
                                 title
                             } else {
                                 resolved_title
                             };
-                            let _ = etx.send(ScEvt::View(view_title, Ok(items)));
+                            let _ = etx.send(ScEvt::View(
+                                view_title,
+                                view_kind_from_browse_hint(hint),
+                                Ok(items),
+                            ));
                         }
                         Err(err) => {
-                            let _ = etx.send(ScEvt::View(title, Err(err)));
+                            let _ = etx.send(ScEvt::View(title, ViewKind::Generic, Err(err)));
+                        }
+                    }
+                }
+                ScReq::ResolveCollection(id, title, kind, action) => {
+                    let res = sc
+                        .lock()
+                        .unwrap()
+                        .browse_page(&id, 120)
+                        .map(|(resolved_title, items)| {
+                            let view_title = if resolved_title.trim().is_empty() {
+                                title.clone()
+                            } else {
+                                resolved_title
+                            };
+                            (view_title, items)
+                        })
+                        .map_err(|e| e.to_string());
+                    match res {
+                        Ok((view_title, items)) => {
+                            if items.is_empty() {
+                                let _ = etx.send(ScEvt::Collection(
+                                    title,
+                                    kind,
+                                    action,
+                                    Err("No playable items found".to_string()),
+                                ));
+                                continue;
+                            }
+                            let _ = etx.send(ScEvt::Collection(view_title, kind, action, Ok(items)));
+                        }
+                        Err(err) => {
+                            let _ = etx.send(ScEvt::Collection(title, kind, action, Err(err)));
                         }
                     }
                 }
@@ -980,7 +1319,11 @@ fn start_sc(sc: Arc<Mutex<SoundCloudClient>>) -> ScSrv {
                         .search_catalog(&q, 48)
                         .map_err(|e| e.to_string());
                     let st = sc.lock().unwrap().state();
-                    let _ = etx.send(ScEvt::View(format!("Search: {}", q), res));
+                    let _ = etx.send(ScEvt::View(
+                        format!("Search: {}", q),
+                        ViewKind::Generic,
+                        res,
+                    ));
                     let _ = etx.send(ScEvt::State(st));
                 }
                 ScReq::Suggest(q) => {
@@ -992,7 +1335,10 @@ fn start_sc(sc: Arc<Mutex<SoundCloudClient>>) -> ScSrv {
                     let _ = etx.send(ScEvt::Suggest(q, res));
                 }
                 ScReq::Login => {
-                    let res = sc.lock().unwrap().login().map_err(|e| e.to_string());
+                    let clients = [sc.clone(), playback_sc.clone()];
+                    let res = youtube_login_window(&paths)
+                        .map_err(|e| e.to_string())
+                        .and_then(|session| apply_auth_session(&clients, &cfg, &paths, session));
                     match res {
                         Ok(st) => {
                             let _ = etx.send(ScEvt::State(st));
@@ -1001,7 +1347,11 @@ fn start_sc(sc: Arc<Mutex<SoundCloudClient>>) -> ScSrv {
                                 .unwrap()
                                 .account_feed(28, 12)
                                 .map_err(|e| e.to_string());
-                            let _ = etx.send(ScEvt::View("Home".to_string(), res));
+                            let _ = etx.send(ScEvt::View(
+                                "Home".to_string(),
+                                ViewKind::Generic,
+                                res,
+                            ));
                         }
                         Err(e) => {
                             let mut st = sc.lock().unwrap().state();
@@ -1011,7 +1361,8 @@ fn start_sc(sc: Arc<Mutex<SoundCloudClient>>) -> ScSrv {
                     }
                 }
                 ScReq::Logout => {
-                    let res = sc.lock().unwrap().logout().map_err(|e| e.to_string());
+                    let clients = [sc.clone(), playback_sc.clone()];
+                    let res = clear_auth_session(&clients, &cfg, &paths);
                     match res {
                         Ok(st) => {
                             let _ = etx.send(ScEvt::State(st));
@@ -1020,7 +1371,11 @@ fn start_sc(sc: Arc<Mutex<SoundCloudClient>>) -> ScSrv {
                                 .unwrap()
                                 .account_feed(28, 12)
                                 .map_err(|e| e.to_string());
-                            let _ = etx.send(ScEvt::View("Home".to_string(), res));
+                            let _ = etx.send(ScEvt::View(
+                                "Home".to_string(),
+                                ViewKind::Generic,
+                                res,
+                            ));
                         }
                         Err(e) => {
                             let mut st = sc.lock().unwrap().state();
@@ -1286,7 +1641,11 @@ fn draw_art_box(f: &mut Frame, app: &mut App, area: Rect) {
         draw_art_hint(
             f,
             inner,
-            &["Sixel off", "set RUSTPLAYER_SIXEL=1"],
+            &[
+                "Artwork disabled",
+                "set RUSTPLAYER_ART=blocks",
+                "or set RUSTPLAYER_ART=sixel",
+            ],
             Alignment::Left,
         );
     } else if app.art_key.is_none() {
@@ -1295,7 +1654,9 @@ fn draw_art_box(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             "Artwork will appear here"
         };
-        draw_art_hint(f, inner, &[msg], Alignment::Center);
+        let renderer = format!("renderer: {}", app.img.renderer_label());
+        let lines = [msg, renderer.as_str()];
+        draw_art_hint(f, inner, &lines, Alignment::Center);
     }
 
     app.art_box = Some(inner);
@@ -1405,6 +1766,28 @@ fn draw_info_box(f: &mut Frame, app: &App, area: Rect) {
                     Color::DarkGray
                 },
             ),
+            Span::raw(" "),
+            pill(
+                match app.repeat_mode {
+                    RepeatMode::Off => "REPEAT OFF",
+                    RepeatMode::All => "REPEAT ALL",
+                    RepeatMode::One => "REPEAT ONE",
+                },
+                match app.repeat_mode {
+                    RepeatMode::Off => Color::DarkGray,
+                    RepeatMode::All => Color::LightBlue,
+                    RepeatMode::One => Color::Yellow,
+                },
+            ),
+            Span::raw(" "),
+            pill(
+                if app.shuffle_on { "SHUFFLE ON" } else { "SHUFFLE OFF" },
+                if app.shuffle_on {
+                    Color::LightCyan
+                } else {
+                    Color::DarkGray
+                },
+            ),
         ];
         if tr.is_sc() {
             let acc = match tr.acc {
@@ -1482,8 +1865,13 @@ fn draw_info_box(f: &mut Frame, app: &App, area: Rect) {
                     if sel.is_artist_browse() {
                         "Press Enter to open this artist page"
                     } else {
-                        "Press Enter to open this playlist or album"
+                        "Press Enter to open it, P to play it, or Q to queue it"
                     },
+                    Style::default().fg(Color::Rgb(104, 113, 124)),
+                )));
+            } else if matches!(app.sc_view_kind, ViewKind::Collection(_)) && sel.is_playable_remote() {
+                lines.push(Line::from(Span::styled(
+                    "Enter plays from here and queues the rest of this collection",
                     Style::default().fg(Color::Rgb(104, 113, 124)),
                 )));
             }
@@ -1609,8 +1997,12 @@ fn draw_foot(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(" play  "),
         hot("a"),
         Span::raw(" queue  "),
+        hot("P/Q"),
+        Span::raw(" play/queue collection  "),
         hot("A"),
         Span::raw(" autoplay  "),
+        hot("R/z"),
+        Span::raw(" repeat/shuffle  "),
         hot("g/m"),
         Span::raw(" home/library  "),
         hot("l"),
@@ -1642,15 +2034,18 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("s switch local / youtube"),
         Line::from("/ search current mode"),
-        Line::from("enter play track or open selected youtube playlist"),
+        Line::from("enter play track, or open a selected youtube playlist or album"),
         Line::from("tab accept selected live suggestion in youtube search"),
         Line::from("a add selected track to queue"),
+        Line::from("P play a selected playlist/album, or restart the open collection"),
+        Line::from("Q queue a selected playlist/album, or queue the open collection"),
         Line::from("space pause, r resume, n next, p prev"),
+        Line::from("R cycle repeat off/all/one, z toggle playlist shuffle"),
         Line::from("left/right seek 5s, b/f seek 30s"),
         Line::from("o open selected youtube link"),
         Line::from("i preview selected artwork with wimg"),
         Line::from("g load youtube home, m load account playlists, u go back"),
-        Line::from("A toggle autoplay, l sign in or out of youtube cookies"),
+        Line::from("A toggle autoplay, l open YouTube login or sign out"),
         Line::from("+/- volume, 0 mute"),
         Line::from("d audio devices, F local folders"),
         Line::from("v visualizer, j/k move, J/K queue"),
@@ -1659,11 +2054,12 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "CLI / Auth",
             Style::default().fg(Color::Yellow).bold(),
         )),
-        Line::from("browser oauth login is not built in"),
-        Line::from("personalized home and library playlists use youtube cookies"),
-        Line::from("metrolist-style cookie login is supported"),
+        Line::from("l opens a dedicated YouTube Music login window on Windows"),
+        Line::from("personalized home and library playlists use the captured session"),
         Line::from("use: rustplayer auth cookie-file <cookies.txt>"),
         Line::from("or : rustplayer auth cookie-header \"SID=...; SAPISID=...\""),
+        Line::from("or : rustplayer auth headers-file <headers.json>"),
+        Line::from("or : rustplayer auth login"),
         Line::from("download: rustplayer download <url> --format m4a|mp3"),
         Line::from("control : rustplayer status | play | pause | next"),
         Line::from("q or esc closes overlays, q quits app"),

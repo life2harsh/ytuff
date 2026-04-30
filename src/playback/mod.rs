@@ -1,14 +1,18 @@
 use crate::core::track::Track;
 use crate::core::Core;
 use crate::sources::soundcloud::SoundCloudClient;
+use rand::seq::SliceRandom;
 use rodio::buffer::SamplesBuffer;
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use rustfft::{algorithm::Radix4, Fft, FftDirection};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek};
+use std::panic::{self, AssertUnwindSafe};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +30,11 @@ use symphonia::default::{get_codecs, get_probe};
 pub enum PlaybackCommand {
     PlayIndex(usize),
     PlayTrack(String),
+    PlayCollection {
+        ids: Vec<String>,
+        start_index: usize,
+        kind: CollectionKind,
+    },
     PlayFile(String),
     Pause,
     Resume,
@@ -40,9 +49,42 @@ pub enum PlaybackCommand {
     SkipBackward(u64),
     ToggleVisualizer,
     ToggleAutoplay,
+    ToggleRepeat,
+    ToggleShuffle,
     SetAutoplay(bool),
     ListDevices,
     SwitchDevice(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionKind {
+    Playlist,
+    Album,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepeatMode {
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "repeat off",
+            Self::All => "repeat all",
+            Self::One => "repeat one",
+        }
+    }
 }
 
 pub struct PlaybackHandle {
@@ -50,9 +92,131 @@ pub struct PlaybackHandle {
     pub position_rx: Arc<Mutex<Option<(u64, u64, bool)>>>,
     pub devices_rx: Receiver<Vec<(String, bool)>>,
     pub autoplay_rx: Receiver<bool>,
+    pub repeat_rx: Receiver<RepeatMode>,
+    pub shuffle_rx: Receiver<bool>,
     pub volume_rx: Receiver<f32>,
     pub visualizer_rx: Receiver<Vec<f32>>,
     pub msg_rx: Receiver<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveCollection {
+    all_ids: Vec<String>,
+    kind: CollectionKind,
+    cycle_scope: Vec<String>,
+    cycle_order: Vec<String>,
+}
+
+impl ActiveCollection {
+    fn new(
+        ids: Vec<String>,
+        start_index: usize,
+        kind: CollectionKind,
+        shuffle: bool,
+    ) -> Option<Self> {
+        if ids.is_empty() || start_index >= ids.len() {
+            return None;
+        }
+
+        let cycle_scope = ids[start_index..].to_vec();
+        let cycle_order = collection_order_from_scope(&cycle_scope, kind, shuffle);
+        Some(Self {
+            all_ids: ids,
+            kind,
+            cycle_scope,
+            cycle_order,
+        })
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.cycle_order.iter().any(|candidate| candidate == id)
+    }
+
+    fn is_playlist(&self) -> bool {
+        self.kind == CollectionKind::Playlist
+    }
+
+    fn current_id(&self) -> Option<&str> {
+        self.cycle_order.first().map(String::as_str)
+    }
+
+    fn set_current(&mut self, current_id: &str) -> bool {
+        let order_pos = match self
+            .cycle_order
+            .iter()
+            .position(|candidate| candidate == current_id)
+        {
+            Some(pos) => pos,
+            None => return false,
+        };
+        if order_pos > 0 {
+            self.cycle_order = self.cycle_order[order_pos..].to_vec();
+        }
+
+        if self.cycle_scope.first().map(String::as_str) == Some(current_id) {
+            return true;
+        }
+
+        let mut next_scope = vec![current_id.to_string()];
+        next_scope.extend(
+            self.cycle_scope
+                .iter()
+                .skip(1)
+                .filter(|candidate| candidate.as_str() != current_id)
+                .cloned(),
+        );
+        self.cycle_scope = next_scope;
+        true
+    }
+
+    fn rebuild_order(&mut self, shuffle: bool) {
+        self.cycle_order = collection_order_from_scope(&self.cycle_scope, self.kind, shuffle);
+    }
+
+    fn restart_cycle(&mut self, shuffle: bool) {
+        self.cycle_scope = self.all_ids.clone();
+        self.rebuild_order(shuffle);
+    }
+}
+
+fn collection_order_from_scope(
+    scope: &[String],
+    kind: CollectionKind,
+    shuffle: bool,
+) -> Vec<String> {
+    let Some((current, rest)) = scope.split_first() else {
+        return Vec::new();
+    };
+
+    let mut order = vec![current.clone()];
+    let mut remaining = rest.to_vec();
+    if shuffle && kind == CollectionKind::Playlist && remaining.len() > 1 {
+        remaining.shuffle(&mut rand::thread_rng());
+    }
+    order.extend(remaining);
+    order
+}
+
+fn sync_collection_queue(core: &Core, collection: &ActiveCollection, extras: &[String]) {
+    core.clear_queue();
+    for id in collection.cycle_order.iter().skip(1) {
+        core.enqueue(id.clone());
+    }
+    for id in extras {
+        core.enqueue(id.clone());
+    }
+}
+
+fn non_collection_queue_ids(core: &Core, collection: &ActiveCollection) -> Vec<String> {
+    let collection_ids = collection
+        .all_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    core.q_ids()
+        .into_iter()
+        .filter(|id| !collection_ids.contains(id.as_str()))
+        .collect()
 }
 
 struct VisualizerSource<S> {
@@ -202,9 +366,63 @@ impl FftProcessor {
     }
 }
 
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "unknown decoder panic".to_string()
+    }
+}
+
+fn track_label(label: &str) -> String {
+    Path::new(label)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(label)
+        .to_string()
+}
+
+fn catch_decoder_init<T, F>(f: F) -> Result<T, Box<dyn std::any::Any + Send>>
+where
+    F: FnOnce() -> T,
+{
+    static DECODER_PANIC_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    let guard = DECODER_PANIC_GUARD.get_or_init(|| Mutex::new(())).lock();
+
+    let previous_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+    let result = panic::catch_unwind(AssertUnwindSafe(f));
+    panic::set_hook(previous_hook);
+
+    if let Ok(guard) = guard {
+        drop(guard);
+    }
+
+    result
+}
+
+fn decoder_from_reader<R>(reader: R, label: &str) -> anyhow::Result<Decoder<BufReader<R>>>
+where
+    R: Read + Seek + Send + Sync + 'static,
+{
+    let shown = track_label(label);
+    let decoder = catch_decoder_init(|| Decoder::new(BufReader::new(reader))).map_err(|payload| {
+        anyhow::anyhow!(
+            "Decoder crashed while opening {}: {}",
+            shown,
+            panic_message(payload)
+        )
+    })?;
+
+    decoder.map_err(|err| anyhow::anyhow!("Could not decode {}: {}", shown, err))
+}
+
 fn sink_from_reader<R>(
     handle: &OutputStreamHandle,
     reader: R,
+    label: &str,
     fft_processor: Arc<Mutex<FftProcessor>>,
     visualizer_tx: Sender<Vec<f32>>,
     visualizer_enabled: Arc<Mutex<bool>>,
@@ -213,7 +431,7 @@ fn sink_from_reader<R>(
 where
     R: Read + Seek + Send + Sync + 'static,
 {
-    let source = Decoder::new(BufReader::new(reader))?;
+    let source = decoder_from_reader(reader, label)?;
     let duration = source.total_duration().map(|d| d.as_secs()).unwrap_or(0);
     sink_from_source(
         handle,
@@ -258,6 +476,7 @@ fn sink_from_local_file(
     sink_from_reader(
         handle,
         file,
+        path,
         fft_processor,
         visualizer_tx,
         visualizer_enabled,
@@ -274,25 +493,60 @@ fn sink_from_remote_track(
     visualizer_enabled: Arc<Mutex<bool>>,
     volume: f32,
 ) -> anyhow::Result<(Sink, u64)> {
-    let bytes = {
+    let fallback_duration = track.dur.unwrap_or(0);
+    let cached = {
         let mut client = sc_client.lock().unwrap();
-        if let Some(bytes) = client.take_cached_audio(&track.id) {
-            bytes
-        } else {
-            let first = client.stream(track)?;
+        client.take_cached_audio(&track.id)
+    };
 
-            match client.download_stream(&first.url) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    client.invalidate_stream(&track.id);
-                    let retry = client.stream(track)?;
-                    client.download_stream(&retry.url)?
-                }
+    if let Some(bytes) = cached {
+        let (sink, duration) = if bytes.get(4..8) == Some(b"ftyp") {
+            sink_from_m4a_bytes(
+                handle,
+                bytes,
+                fft_processor,
+                visualizer_tx,
+                visualizer_enabled,
+                volume,
+            )?
+        } else {
+            sink_from_reader(
+                handle,
+                Cursor::new(bytes),
+                "cached streamed audio",
+                fft_processor,
+                visualizer_tx,
+                visualizer_enabled,
+                volume,
+            )?
+        };
+
+        return Ok((
+            sink,
+            if duration == 0 {
+                fallback_duration
+            } else {
+                duration
+            },
+        ));
+    }
+
+    let bytes = {
+        let mut client = sc_client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("The YouTube client is unavailable"))?
+            .clone();
+        let stream = client.stream(track)?;
+        match client.download_stream(&stream.url) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                client.invalidate_stream(&track.id);
+                let retry = client.stream(track)?;
+                client.download_stream(&retry.url)?
             }
         }
     };
 
-    let fallback_duration = track.dur.unwrap_or(0);
     let (sink, duration) = if bytes.get(4..8) == Some(b"ftyp") {
         sink_from_m4a_bytes(
             handle,
@@ -306,6 +560,7 @@ fn sink_from_remote_track(
         sink_from_reader(
             handle,
             Cursor::new(bytes),
+            &format!("downloaded stream {}", track.title),
             fft_processor,
             visualizer_tx,
             visualizer_enabled,
@@ -336,8 +591,19 @@ fn prefetch_next_remote_track(core: &Core, sc_client: &Arc<Mutex<SoundCloudClien
 
     let sc_client = Arc::clone(sc_client);
     thread::spawn(move || {
-        if let Ok(mut client) = sc_client.lock() {
-            let _ = client.prefetch_track(&track);
+        let mut worker = match sc_client.lock() {
+            Ok(client) => client.clone(),
+            Err(_) => return,
+        };
+        if worker.prefetch_track(&track).is_err() {
+            return;
+        }
+        let Some(bytes) = worker.take_cached_audio(&track.id) else {
+            return;
+        };
+
+        if let Ok(mut shared) = sc_client.lock() {
+            shared.store_cached_audio(&track.id, bytes);
         }
     });
 }
@@ -504,8 +770,221 @@ fn prepare_track_sink(
     }
 }
 
+fn audio_device_name(device: &rodio::cpal::Device) -> Option<String> {
+    device
+        .name()
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn list_output_device_names(host: &rodio::cpal::Host) -> Vec<String> {
+    let mut names = Vec::new();
+
+    if let Ok(devices) = host.output_devices() {
+        for device in devices {
+            if let Some(name) = audio_device_name(&device) {
+                names.push(name);
+            }
+        }
+    }
+
+    names
+}
+
+fn open_output_stream_for_device(
+    device: &rodio::cpal::Device,
+) -> anyhow::Result<(OutputStream, OutputStreamHandle, String)> {
+    let name = audio_device_name(device)
+        .ok_or_else(|| anyhow::anyhow!("Could not determine the audio device name"))?;
+    let (stream, handle) = OutputStream::try_from_device(device)
+        .map_err(|err| anyhow::anyhow!("Could not open audio device {}: {}", name, err))?;
+    Ok((stream, handle, name))
+}
+
+fn open_named_output_stream(
+    host: &rodio::cpal::Host,
+    device_name: &str,
+) -> anyhow::Result<(OutputStream, OutputStreamHandle, String)> {
+    let devices = host
+        .output_devices()
+        .map_err(|err| anyhow::anyhow!("Could not enumerate audio devices: {}", err))?;
+
+    for device in devices {
+        if audio_device_name(&device).as_deref() == Some(device_name) {
+            return open_output_stream_for_device(&device);
+        }
+    }
+
+    Err(anyhow::anyhow!("Audio device {} is no longer available", device_name))
+}
+
+fn open_default_output_stream(
+    host: &rodio::cpal::Host,
+) -> anyhow::Result<(OutputStream, OutputStreamHandle, String)> {
+    let default_name = host.default_output_device().and_then(|device| audio_device_name(&device));
+    let mut last_error = None::<String>;
+
+    if let Some(device) = host.default_output_device() {
+        match open_output_stream_for_device(&device) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = Some(err.to_string()),
+        }
+    }
+
+    if let Ok(devices) = host.output_devices() {
+        for device in devices {
+            let Some(name) = audio_device_name(&device) else {
+                continue;
+            };
+            if default_name.as_ref() == Some(&name) {
+                continue;
+            }
+
+            match OutputStream::try_from_device(&device) {
+                Ok((stream, handle)) => return Ok((stream, handle, name)),
+                Err(err) => {
+                    last_error = Some(format!("Could not open audio device {}: {}", name, err));
+                }
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "{}",
+        last_error.unwrap_or_else(|| "No audio output device is available".to_string())
+    ))
+}
+
+fn restore_playback_on_handle(
+    handle: &OutputStreamHandle,
+    current_track_id: &Option<String>,
+    current_file_path: &Option<String>,
+    core: &Core,
+    sc_client: &Arc<Mutex<SoundCloudClient>>,
+    fft_processor: Arc<Mutex<FftProcessor>>,
+    visualizer_tx: Sender<Vec<f32>>,
+    visualizer_enabled: Arc<Mutex<bool>>,
+    volume: f32,
+) -> anyhow::Result<Option<(Sink, u64)>> {
+    if let Some(track_id) = current_track_id.as_deref() {
+        let track = core
+            .track(track_id)
+            .ok_or_else(|| anyhow::anyhow!("The selected track is no longer available"))?;
+        return prepare_track_sink(
+            handle,
+            &track,
+            sc_client,
+            fft_processor,
+            visualizer_tx,
+            visualizer_enabled,
+            volume,
+        )
+        .map(Some);
+    }
+
+    if let Some(path) = current_file_path.as_deref() {
+        return sink_from_local_file(
+            handle,
+            path,
+            fft_processor,
+            visualizer_tx,
+            visualizer_enabled,
+            volume,
+        )
+        .map(Some);
+    }
+
+    Ok(None)
+}
+
+struct RebuiltOutput {
+    stream: OutputStream,
+    handle: OutputStreamHandle,
+    device_name: String,
+    sink: Option<Sink>,
+    duration: u64,
+    restore_error: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebuild_output_stream(
+    host: &rodio::cpal::Host,
+    preferred_device_name: Option<&str>,
+    allow_fallback_to_default: bool,
+    core: &Core,
+    sc_client: &Arc<Mutex<SoundCloudClient>>,
+    current_track_id: &Option<String>,
+    current_file_path: &Option<String>,
+    saved_position: u64,
+    was_playing: bool,
+    fft_processor: Arc<Mutex<FftProcessor>>,
+    visualizer_tx: Sender<Vec<f32>>,
+    visualizer_enabled: Arc<Mutex<bool>>,
+    volume: f32,
+) -> anyhow::Result<RebuiltOutput> {
+    let (stream, handle, device_name) = match preferred_device_name {
+        Some(name) => match open_named_output_stream(host, name) {
+            Ok(stream) => stream,
+            Err(err) if allow_fallback_to_default => {
+                let _ = err;
+                open_default_output_stream(host)?
+            }
+            Err(err) => return Err(err),
+        },
+        None => open_default_output_stream(host)?,
+    };
+
+    let mut restore_error = None;
+    let mut sink = None;
+    let mut duration = 0;
+
+    match restore_playback_on_handle(
+        &handle,
+        current_track_id,
+        current_file_path,
+        core,
+        sc_client,
+        fft_processor,
+        visualizer_tx,
+        visualizer_enabled,
+        volume,
+    ) {
+        Ok(Some((new_sink, new_duration))) => {
+            if saved_position > 0 {
+                if let Err(err) = new_sink.try_seek(Duration::from_secs(saved_position)) {
+                    restore_error = Some(format!("Seek restore failed after switching audio output: {:?}", err));
+                }
+            }
+
+            if !was_playing {
+                new_sink.pause();
+            }
+
+            duration = new_duration;
+            sink = Some(new_sink);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            restore_error = Some(err.to_string());
+        }
+    }
+
+    Ok(RebuiltOutput {
+        stream,
+        handle,
+        device_name,
+        sink,
+        duration,
+        restore_error,
+    })
+}
+
 fn fill_autoplay_queue(core: &Core, sc_client: &Arc<Mutex<SoundCloudClient>>, seed: &Track) -> bool {
     if !seed.is_playable_remote() {
+        return false;
+    }
+    if !core.q_ids().is_empty() {
         return false;
     }
 
@@ -516,7 +995,7 @@ fn fill_autoplay_queue(core: &Core, sc_client: &Arc<Mutex<SoundCloudClient>>, se
         .collect::<std::collections::HashSet<_>>();
 
     let mut client = match sc_client.lock() {
-        Ok(client) => client,
+        Ok(client) => client.clone(),
         Err(_) => return false,
     };
     let Ok(results) = client.watch_next(seed, 8) else {
@@ -542,6 +1021,26 @@ fn fill_autoplay_queue(core: &Core, sc_client: &Arc<Mutex<SoundCloudClient>>, se
     true
 }
 
+fn maybe_seed_autoplay_queue(
+    core: &Core,
+    sc_client: &Arc<Mutex<SoundCloudClient>>,
+    track: &Track,
+    autoplay: bool,
+) {
+    if !autoplay || !track.is_playable_remote() || !core.q_ids().is_empty() {
+        return;
+    }
+
+    let core = core.clone();
+    let sc_client = Arc::clone(sc_client);
+    let seed = track.clone();
+    thread::spawn(move || {
+        if fill_autoplay_queue(&core, &sc_client, &seed) {
+            prefetch_next_remote_track(&core, &sc_client);
+        }
+    });
+}
+
 pub fn start_audio_thread(
     core: Core,
     sc_client: Arc<Mutex<SoundCloudClient>>,
@@ -553,6 +1052,8 @@ pub fn start_audio_thread(
     let position_clone = position.clone();
 
     let (autoplay_tx, autoplay_rx): (Sender<bool>, Receiver<bool>) = mpsc::channel();
+    let (repeat_tx, repeat_rx): (Sender<RepeatMode>, Receiver<RepeatMode>) = mpsc::channel();
+    let (shuffle_tx, shuffle_rx): (Sender<bool>, Receiver<bool>) = mpsc::channel();
     let (volume_tx, volume_rx): (Sender<f32>, Receiver<f32>) = mpsc::channel();
     let (visualizer_tx, visualizer_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = mpsc::channel();
     let (devices_tx, devices_rx) = mpsc::channel::<Vec<(String, bool)>>();
@@ -562,33 +1063,36 @@ pub fn start_audio_thread(
         let host = rodio::cpal::default_host();
         let mut _stream: Option<OutputStream> = None;
         let mut stream_handle: Option<OutputStreamHandle> = None;
+        let mut current_device_name: Option<String> = None;
 
-        if let Ok((stream, handle)) = OutputStream::try_default() {
+        if let Ok((stream, handle, device_name)) = open_default_output_stream(&host) {
             _stream = Some(stream);
             stream_handle = Some(handle);
+            current_device_name = Some(device_name);
         }
 
         let mut sink: Option<Sink> = None;
         let mut current_track_id: Option<String> = None;
+        let mut current_file_path: Option<String> = None;
         let mut current_duration: u64 = 0;
         let mut volume = 1.0f32;
         let mut autoplay = autoplay_initial;
+        let mut repeat_mode = RepeatMode::Off;
+        let mut shuffle_enabled = false;
+        let mut active_collection = None::<ActiveCollection>;
         let mut elapsed_before_pause: u64 = 0;
         let mut playback_start: Option<Instant> = None;
         let mut is_paused = false;
-        let mut current_device_name: Option<String> = None;
         let mut last_finished_track_id: Option<String> = None;
-
-        if let Some(ref device) = host.default_output_device() {
-            if let Ok(name) = device.name() {
-                current_device_name = Some(name);
-            }
-        }
+        let mut waiting_for_output_recovery = stream_handle.is_none();
+        let mut last_device_check = Instant::now();
 
         let fft_processor = Arc::new(Mutex::new(FftProcessor::new(2048)));
         let visualizer_enabled = Arc::new(Mutex::new(false));
 
         autoplay_tx.send(autoplay).ok();
+        repeat_tx.send(repeat_mode).ok();
+        shuffle_tx.send(shuffle_enabled).ok();
         volume_tx.send(volume).ok();
 
         loop {
@@ -621,15 +1125,122 @@ pub fn start_audio_thread(
             }
             *position_clone.lock().unwrap() = Some((current_pos, current_duration, is_playing));
 
+            if last_device_check.elapsed() >= Duration::from_millis(750) {
+                last_device_check = Instant::now();
+
+                let available_devices = list_output_device_names(&host);
+                let current_device_available = current_device_name
+                    .as_ref()
+                    .is_some_and(|name| available_devices.iter().any(|device| device == name));
+                let needs_output_recovery = stream_handle.is_none()
+                    || current_device_name.is_none()
+                    || !current_device_available;
+
+                if needs_output_recovery {
+                    let previous_device_name = current_device_name.clone();
+                    let saved_track_id = current_track_id.clone();
+                    let saved_file_path = current_file_path.clone();
+                    let saved_position = current_pos;
+                    let was_playing = !is_paused
+                        && (sink.is_some()
+                            || saved_track_id.is_some()
+                            || saved_file_path.is_some());
+
+                    sink = None;
+                    _stream = None;
+                    stream_handle = None;
+                    current_device_name = None;
+                    elapsed_before_pause = saved_position;
+                    playback_start = None;
+
+                    match rebuild_output_stream(
+                        &host,
+                        None,
+                        true,
+                        &core,
+                        &sc_client,
+                        &saved_track_id,
+                        &saved_file_path,
+                        saved_position,
+                        was_playing,
+                        fft_processor.clone(),
+                        visualizer_tx.clone(),
+                        visualizer_enabled.clone(),
+                        volume,
+                    ) {
+                        Ok(recovered) => {
+                            _stream = Some(recovered.stream);
+                            stream_handle = Some(recovered.handle);
+                            current_device_name = Some(recovered.device_name.clone());
+                            sink = recovered.sink;
+                            if sink.is_some() {
+                                current_duration = recovered.duration;
+                                is_paused = !was_playing;
+                                playback_start = Some(Instant::now());
+                            }
+                            waiting_for_output_recovery = false;
+
+                            let recovery_msg = if let Some(old_name) = previous_device_name {
+                                if old_name == recovered.device_name {
+                                    format!("audio output restored on {}", recovered.device_name)
+                                } else {
+                                    format!(
+                                        "audio device {} disconnected, switched to {}",
+                                        old_name, recovered.device_name
+                                    )
+                                }
+                            } else {
+                                format!("audio output connected: {}", recovered.device_name)
+                            };
+                            msg_tx.send(recovery_msg).ok();
+
+                            if let Some(err) = recovered.restore_error {
+                                msg_tx.send(err).ok();
+                            }
+                        }
+                        Err(err) => {
+                            if !waiting_for_output_recovery {
+                                msg_tx
+                                    .send(format!(
+                                        "audio output unavailable; waiting for another device ({})",
+                                        err
+                                    ))
+                                    .ok();
+                                waiting_for_output_recovery = true;
+                            }
+                        }
+                    }
+                } else {
+                    waiting_for_output_recovery = false;
+                }
+            }
+
             if playback_finished {
                 if let Some(current_id) = current_track_id.clone() {
                     if last_finished_track_id.as_deref() != Some(current_id.as_str()) {
+                        if repeat_mode == RepeatMode::One {
+                            last_finished_track_id = Some(current_id.clone());
+                            tx_clone.send(PlaybackCommand::PlayTrack(current_id)).ok();
+                            continue;
+                        }
                         if core.q_ids().is_empty() && autoplay {
                             if let Some(seed) = core.track(&current_id) {
                                 fill_autoplay_queue(&core, &sc_client, &seed);
                             }
                         }
-                        if let Some(next_id) = core.dequeue() {
+                        let mut next_id = core.dequeue();
+                        if next_id.is_none() {
+                            if let Some(collection) = active_collection.as_mut() {
+                                if repeat_mode == RepeatMode::All {
+                                    collection.restart_cycle(shuffle_enabled);
+                                    sync_collection_queue(&core, collection, &[]);
+                                    next_id = collection.current_id().map(ToOwned::to_owned);
+                                }
+                            } else if repeat_mode == RepeatMode::All {
+                                next_id = Some(current_id.clone());
+                            }
+                        }
+                        if let Some(next_id) = next_id {
                             last_finished_track_id = Some(current_id);
                             tx_clone.send(PlaybackCommand::PlayTrack(next_id)).ok();
                             continue;
@@ -644,7 +1255,17 @@ pub fn start_audio_thread(
                     PlaybackCommand::PlayIndex(idx) => {
                         let track = core.tracks.lock().unwrap().get(idx).cloned();
                         if let Some(track) = track {
-                            let handle = stream_handle.as_ref().expect("No audio output available");
+                            active_collection = None;
+                            if shuffle_enabled {
+                                shuffle_enabled = false;
+                                shuffle_tx.send(false).ok();
+                            }
+                            let Some(handle) = stream_handle.as_ref() else {
+                                msg_tx
+                                    .send("No audio output available; waiting for another device".to_string())
+                                    .ok();
+                                continue;
+                            };
 
                             sink = None;
                             if track.is_sc() {
@@ -663,17 +1284,20 @@ pub fn start_audio_thread(
                                     last_finished_track_id = None;
                                     current_duration = duration;
                                     current_track_id = Some(track.id.clone());
+                                    current_file_path = None;
                                     core.set_cur(Some(track.id.clone()));
                                     core.add_hist(track.id.clone());
                                     sink = Some(new_sink);
                                     is_paused = false;
                                     elapsed_before_pause = 0;
                                     playback_start = Some(Instant::now());
+                                    maybe_seed_autoplay_queue(&core, &sc_client, &track, autoplay);
                                     prefetch_next_remote_track(&core, &sc_client);
                                 }
                                 Err(e) => {
                                     last_finished_track_id = None;
                                     current_track_id = None;
+                                    current_file_path = None;
                                     core.set_cur(None);
                                     msg_tx.send(e.to_string()).ok();
                                 }
@@ -682,7 +1306,26 @@ pub fn start_audio_thread(
                     }
                     PlaybackCommand::PlayTrack(id) => {
                         if let Some(track) = core.track(&id) {
-                            let handle = stream_handle.as_ref().expect("No audio output available");
+                            let in_active_collection = active_collection
+                                .as_ref()
+                                .is_some_and(|collection| collection.contains(&id));
+                            if let Some(collection) = active_collection.as_mut() {
+                                if in_active_collection {
+                                    collection.set_current(&id);
+                                } else {
+                                    active_collection = None;
+                                }
+                            }
+                            if active_collection.is_none() && shuffle_enabled {
+                                shuffle_enabled = false;
+                                shuffle_tx.send(false).ok();
+                            }
+                            let Some(handle) = stream_handle.as_ref() else {
+                                msg_tx
+                                    .send("No audio output available; waiting for another device".to_string())
+                                    .ok();
+                                continue;
+                            };
 
                             sink = None;
                             if track.is_sc() {
@@ -701,17 +1344,20 @@ pub fn start_audio_thread(
                                     last_finished_track_id = None;
                                     current_duration = duration;
                                     current_track_id = Some(id.clone());
+                                    current_file_path = None;
                                     core.set_cur(Some(id.clone()));
                                     core.add_hist(id);
                                     sink = Some(new_sink);
                                     is_paused = false;
                                     elapsed_before_pause = 0;
                                     playback_start = Some(Instant::now());
+                                    maybe_seed_autoplay_queue(&core, &sc_client, &track, autoplay);
                                     prefetch_next_remote_track(&core, &sc_client);
                                 }
                                 Err(e) => {
                                     last_finished_track_id = None;
                                     current_track_id = None;
+                                    current_file_path = None;
                                     core.set_cur(None);
                                     msg_tx.send(e.to_string()).ok();
                                 }
@@ -722,34 +1368,84 @@ pub fn start_audio_thread(
                                 .ok();
                         }
                     }
+                    PlaybackCommand::PlayCollection {
+                        ids,
+                        start_index,
+                        kind,
+                    } => {
+                        let active = match ActiveCollection::new(
+                            ids,
+                            start_index,
+                            kind,
+                            shuffle_enabled,
+                        ) {
+                            Some(active) => active,
+                            None => {
+                                msg_tx
+                                    .send("That collection does not contain any playable tracks".to_string())
+                                    .ok();
+                                continue;
+                            }
+                        };
+
+                        if !active.is_playlist() && shuffle_enabled {
+                            shuffle_enabled = false;
+                            shuffle_tx.send(false).ok();
+                        }
+
+                        let Some(track_id) = active.current_id().map(ToOwned::to_owned) else {
+                            msg_tx
+                                .send("That collection does not contain any playable tracks".to_string())
+                                .ok();
+                            continue;
+                        };
+
+                        sync_collection_queue(&core, &active, &[]);
+                        active_collection = Some(active);
+                        last_finished_track_id = None;
+                        tx_clone.send(PlaybackCommand::PlayTrack(track_id)).ok();
+                    }
                     PlaybackCommand::PlayFile(path) => {
                         sink = None;
                         current_track_id = None;
+                        current_file_path = None;
                         core.set_cur(None);
                         last_finished_track_id = None;
+                        active_collection = None;
+                        if shuffle_enabled {
+                            shuffle_enabled = false;
+                            shuffle_tx.send(false).ok();
+                        }
 
-                        let handle = stream_handle.as_ref().expect("No audio output available");
-                        let new_sink = Sink::try_new(handle).unwrap();
-
-                        if let Ok(file) = File::open(&path) {
-                            if let Ok(source) = Decoder::new(BufReader::new(file)) {
-                                current_duration =
-                                    source.total_duration().map(|d| d.as_secs()).unwrap_or(0);
-
-                                let tapped = VisualizerSource::new(
-                                    source.convert_samples(),
-                                    fft_processor.clone(),
-                                    visualizer_tx.clone(),
-                                    visualizer_enabled.clone(),
-                                );
-
-                                new_sink.append(tapped);
-                                new_sink.set_volume(volume);
+                        let Some(handle) = stream_handle.as_ref() else {
+                            msg_tx
+                                .send("No audio output available; waiting for another device".to_string())
+                                .ok();
+                            continue;
+                        };
+                        match sink_from_local_file(
+                            handle,
+                            &path,
+                            fft_processor.clone(),
+                            visualizer_tx.clone(),
+                            visualizer_enabled.clone(),
+                            volume,
+                        ) {
+                            Ok((new_sink, duration)) => {
+                                current_duration = duration;
+                                current_file_path = Some(path.clone());
                                 sink = Some(new_sink);
                                 is_paused = false;
                                 elapsed_before_pause = 0;
                                 playback_start = Some(Instant::now());
                                 last_finished_track_id = None;
+                            }
+                            Err(err) => {
+                                current_duration = 0;
+                                current_file_path = None;
+                                elapsed_before_pause = 0;
+                                playback_start = None;
+                                msg_tx.send(err.to_string()).ok();
                             }
                         }
                     }
@@ -774,11 +1470,17 @@ pub fn start_audio_thread(
                     PlaybackCommand::Stop => {
                         sink = None;
                         current_track_id = None;
+                        current_file_path = None;
                         core.set_cur(None);
                         is_paused = false;
                         elapsed_before_pause = 0;
                         current_duration = 0;
                         last_finished_track_id = None;
+                        active_collection = None;
+                        if shuffle_enabled {
+                            shuffle_enabled = false;
+                            shuffle_tx.send(false).ok();
+                        }
                     }
                     PlaybackCommand::VolumeUp => {
                         volume = (volume + 0.1).min(1.0);
@@ -836,6 +1538,17 @@ pub fn start_audio_thread(
                                 }
                             }
                         }
+                        if next_id.is_none() {
+                            if let Some(collection) = active_collection.as_mut() {
+                                if repeat_mode == RepeatMode::All {
+                                    collection.restart_cycle(shuffle_enabled);
+                                    sync_collection_queue(&core, collection, &[]);
+                                    next_id = collection.current_id().map(ToOwned::to_owned);
+                                }
+                            } else if repeat_mode == RepeatMode::All {
+                                next_id = current_track_id.clone();
+                            }
+                        }
                         if let Some(next_id) = next_id {
                             last_finished_track_id = None;
                             tx_clone.send(PlaybackCommand::PlayTrack(next_id)).ok();
@@ -861,6 +1574,37 @@ pub fn start_audio_thread(
                             .send(format!(
                                 "autoplay {}",
                                 if autoplay { "enabled" } else { "disabled" }
+                            ))
+                            .ok();
+                    }
+                    PlaybackCommand::ToggleRepeat => {
+                        repeat_mode = repeat_mode.cycle();
+                        repeat_tx.send(repeat_mode).ok();
+                        msg_tx.send(repeat_mode.label().to_string()).ok();
+                    }
+                    PlaybackCommand::ToggleShuffle => {
+                        let Some(collection) = active_collection.as_mut() else {
+                            msg_tx
+                                .send("open or start a playlist before toggling shuffle".to_string())
+                                .ok();
+                            continue;
+                        };
+                        if !collection.is_playlist() {
+                            msg_tx
+                                .send("shuffle only works for playlists".to_string())
+                                .ok();
+                            continue;
+                        }
+
+                        shuffle_enabled = !shuffle_enabled;
+                        let extras = non_collection_queue_ids(&core, collection);
+                        collection.rebuild_order(shuffle_enabled);
+                        sync_collection_queue(&core, collection, &extras);
+                        shuffle_tx.send(shuffle_enabled).ok();
+                        msg_tx
+                            .send(format!(
+                                "playlist shuffle {}",
+                                if shuffle_enabled { "on" } else { "off" }
                             ))
                             .ok();
                     }
@@ -891,74 +1635,54 @@ pub fn start_audio_thread(
                     }
                     PlaybackCommand::SwitchDevice(device_name) => {
                         let saved_track_id = current_track_id.clone();
+                        let saved_file_path = current_file_path.clone();
                         let saved_position = current_pos;
-                        let was_playing = !is_paused && sink.is_some();
+                        let was_playing = !is_paused
+                            && (sink.is_some()
+                                || saved_track_id.is_some()
+                                || saved_file_path.is_some());
 
                         sink = None;
                         stream_handle = None;
                         _stream = None;
+                        current_device_name = None;
+                        elapsed_before_pause = saved_position;
+                        playback_start = None;
 
-                        if let Ok(devices) = host.output_devices() {
-                            for device in devices {
-                                if let Ok(name) = device.name() {
-                                    if name == device_name {
-                                        match OutputStream::try_from_device(&device) {
-                                            Ok((stream, handle)) => {
-                                                _stream = Some(stream);
-                                                stream_handle = Some(handle);
-                                                current_device_name = Some(name);
-
-                                                if let Some(id) = saved_track_id.clone() {
-                                                    if let Some(track) = core.track(&id) {
-                                                        let handle =
-                                                            stream_handle.as_ref().unwrap();
-                                                        if let Ok((new_sink, duration)) =
-                                                            prepare_track_sink(
-                                                                handle,
-                                                                &track,
-                                                                &sc_client,
-                                                                fft_processor.clone(),
-                                                                visualizer_tx.clone(),
-                                                                visualizer_enabled.clone(),
-                                                                volume,
-                                                            )
-                                                        {
-                                                            current_duration = duration;
-
-                                                            if saved_position > 0 {
-                                                                new_sink
-                                                                    .try_seek(Duration::from_secs(
-                                                                        saved_position,
-                                                                    ))
-                                                                    .ok();
-                                                            }
-
-                                                            if !was_playing {
-                                                                new_sink.pause();
-                                                                is_paused = true;
-                                                            } else {
-                                                                is_paused = false;
-                                                            }
-
-                                                            sink = Some(new_sink);
-                                                            current_track_id = Some(id);
-                                                            elapsed_before_pause = saved_position;
-                                                            playback_start = Some(Instant::now());
-                                                            last_finished_track_id = None;
-                                                        }
-                                                    }
-                                                }
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "Failed to switch to device {}: {:?}",
-                                                    device_name, e
-                                                );
-                                            }
-                                        }
-                                    }
+                        match rebuild_output_stream(
+                            &host,
+                            Some(device_name.as_str()),
+                            false,
+                            &core,
+                            &sc_client,
+                            &saved_track_id,
+                            &saved_file_path,
+                            saved_position,
+                            was_playing,
+                            fft_processor.clone(),
+                            visualizer_tx.clone(),
+                            visualizer_enabled.clone(),
+                            volume,
+                        ) {
+                            Ok(recovered) => {
+                                _stream = Some(recovered.stream);
+                                stream_handle = Some(recovered.handle);
+                                current_device_name = Some(recovered.device_name);
+                                sink = recovered.sink;
+                                if sink.is_some() {
+                                    current_duration = recovered.duration;
+                                    is_paused = !was_playing;
+                                    playback_start = Some(Instant::now());
+                                    last_finished_track_id = None;
                                 }
+                                waiting_for_output_recovery = false;
+
+                                if let Some(err) = recovered.restore_error {
+                                    msg_tx.send(err).ok();
+                                }
+                            }
+                            Err(err) => {
+                                msg_tx.send(err.to_string()).ok();
                             }
                         }
                     }
@@ -973,6 +1697,8 @@ pub fn start_audio_thread(
         position_rx: position,
         devices_rx,
         autoplay_rx,
+        repeat_rx,
+        shuffle_rx,
         volume_rx,
         visualizer_rx,
         msg_rx,

@@ -1,5 +1,6 @@
 use crate::core::track::{Acc, Track};
 use anyhow::{anyhow, Context, Result};
+use percent_encoding::percent_decode_str;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_RANGE, CONTENT_TYPE, RANGE, REFERER, USER_AGENT};
 use reqwest::StatusCode;
@@ -7,16 +8,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const API_BASE: &str = "https://music.youtube.com/youtubei/v1";
+const VIDEO_API_BASE: &str = "https://www.youtube.com/youtubei/v1";
 const MUSIC_ORIGIN: &str = "https://music.youtube.com";
 const MUSIC_REFERER: &str = "https://music.youtube.com/";
+const VIDEO_ORIGIN: &str = "https://www.youtube.com";
+const VIDEO_REFERER: &str = "https://www.youtube.com/";
+const TV_REFERER: &str = "https://www.youtube.com/tv";
 const WEB_REMIX_CLIENT_VERSION: &str = "1.20260213.01.00";
 const SEARCH_SONGS_FILTER: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
 const VISITOR_PREFIXES: [&str; 2] = ["Cgt", "Cgs"];
-const STREAM_CHUNK_BYTES: u64 = 1024 * 1024;
+const STREAM_DOWNLOAD_CHUNK_BYTES: u64 = 1024 * 1024 * 2;
 const HOME_BROWSE_ID: &str = "FEmusic_home";
 const LIBRARY_PLAYLISTS_BROWSE_ID: &str = "FEmusic_liked_playlists";
 
@@ -74,6 +81,7 @@ pub struct YouTubeClient {
     stream_cache: HashMap<String, CachedStream>,
     audio_cache: HashMap<String, Vec<u8>>,
     cookie_header: Option<String>,
+    auth_user: Option<String>,
     ql: Ql,
 }
 
@@ -85,27 +93,158 @@ struct CachedStream {
 
 #[derive(Clone, Copy, Debug)]
 enum PlaybackClient {
-    AndroidVr143,
-    AndroidVr161,
-    Ios,
-    AndroidCreator,
-    TvEmbedded,
+    AndroidVr,
+    WebSafari,
+    TvDowngraded,
 }
 
 impl PlaybackClient {
-    fn all() -> [Self; 5] {
+    fn candidates(authenticated: bool) -> &'static [Self] {
+        if authenticated {
+            &[Self::TvDowngraded, Self::WebSafari]
+        } else {
+            &[Self::AndroidVr, Self::WebSafari]
+        }
+    }
+
+    fn client_id(self) -> &'static str {
+        match self {
+            Self::AndroidVr => "28",
+            Self::WebSafari => "1",
+            Self::TvDowngraded => "7",
+        }
+    }
+
+    fn client_name(self) -> &'static str {
+        match self {
+            Self::AndroidVr => "ANDROID_VR",
+            Self::WebSafari => "WEB",
+            Self::TvDowngraded => "TVHTML5",
+        }
+    }
+
+    fn client_version(self) -> &'static str {
+        match self {
+            Self::AndroidVr => "1.65.10",
+            Self::WebSafari => "2.20260114.08.00",
+            Self::TvDowngraded => "5.20260114",
+        }
+    }
+
+    fn user_agent(self) -> &'static str {
+        match self {
+            Self::AndroidVr => {
+                "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+            }
+            Self::WebSafari => {
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15,gzip(gfe)"
+            }
+            Self::TvDowngraded => {
+                "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version"
+            }
+        }
+    }
+
+    fn api_base(self) -> &'static str {
+        VIDEO_API_BASE
+    }
+
+    fn origin(self) -> &'static str {
+        VIDEO_ORIGIN
+    }
+
+    fn referer(self) -> &'static str {
+        match self {
+            Self::TvDowngraded => TV_REFERER,
+            Self::AndroidVr | Self::WebSafari => VIDEO_REFERER,
+        }
+    }
+
+    fn supports_cookies(self) -> bool {
+        matches!(self, Self::WebSafari | Self::TvDowngraded)
+    }
+
+    fn request_body(self, visitor_data: &str, video_id: &str) -> Value {
+        let client = match self {
+            Self::AndroidVr => json!({
+                "clientName": "ANDROID_VR",
+                "clientVersion": "1.65.10",
+                "osName": "Android",
+                "osVersion": "12L",
+                "deviceMake": "Oculus",
+                "deviceModel": "Quest 3",
+                "androidSdkVersion": 32,
+                "gl": "US",
+                "hl": "en-US",
+                "userAgent": self.user_agent(),
+                "visitorData": visitor_data,
+            }),
+            Self::WebSafari => json!({
+                "clientName": "WEB",
+                "clientVersion": "2.20260114.08.00",
+                "gl": "US",
+                "hl": "en-US",
+                "userAgent": self.user_agent(),
+                "visitorData": visitor_data,
+            }),
+            Self::TvDowngraded => json!({
+                "clientName": "TVHTML5",
+                "clientVersion": "5.20260114",
+                "gl": "US",
+                "hl": "en-US",
+                "userAgent": self.user_agent(),
+                "visitorData": visitor_data,
+            }),
+        };
+
+        let body = json!({
+            "context": {
+                "client": client,
+                "user": {}
+            },
+            "videoId": video_id,
+            "contentCheckOk": true,
+            "racyCheckOk": true,
+            "playbackContext": {
+                "contentPlaybackContext": {
+                    "html5Preference": "HTML5_PREF_WANTS"
+                }
+            }
+        });
+
+        body
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LegacyStreamPlaybackClient {
+    TvHtml5,
+    TvEmbedded,
+    AndroidVr143,
+    AndroidVr161,
+    AndroidMobile,
+    Ios,
+    AndroidCreator,
+}
+
+impl LegacyStreamPlaybackClient {
+    fn all() -> [Self; 7] {
         [
+            Self::TvEmbedded,
+            Self::TvHtml5,
             Self::AndroidVr143,
             Self::AndroidVr161,
-            Self::Ios,
             Self::AndroidCreator,
-            Self::TvEmbedded,
+            Self::AndroidMobile,
+            Self::Ios,
         ]
     }
 
     fn client_id(self) -> &'static str {
         match self {
+            Self::TvHtml5 => "7",
             Self::AndroidVr143 | Self::AndroidVr161 => "28",
+            Self::AndroidMobile => "3",
             Self::Ios => "5",
             Self::AndroidCreator => "14",
             Self::TvEmbedded => "85",
@@ -114,7 +253,9 @@ impl PlaybackClient {
 
     fn client_name(self) -> &'static str {
         match self {
+            Self::TvHtml5 => "TVHTML5",
             Self::AndroidVr143 | Self::AndroidVr161 => "ANDROID_VR",
+            Self::AndroidMobile => "ANDROID",
             Self::Ios => "IOS",
             Self::AndroidCreator => "ANDROID_CREATOR",
             Self::TvEmbedded => "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
@@ -123,8 +264,10 @@ impl PlaybackClient {
 
     fn client_version(self) -> &'static str {
         match self {
+            Self::TvHtml5 => "7.20260213.00.00",
             Self::AndroidVr143 => "1.43.32",
             Self::AndroidVr161 => "1.61.48",
+            Self::AndroidMobile => "21.03.38",
             Self::Ios => "21.03.1",
             Self::AndroidCreator => "25.03.101",
             Self::TvEmbedded => "2.0",
@@ -133,11 +276,17 @@ impl PlaybackClient {
 
     fn user_agent(self) -> &'static str {
         match self {
+            Self::TvHtml5 => {
+                "Mozilla/5.0(SMART-TV; Linux; Tizen 4.0.0.2) AppleWebkit/605.1.15 (KHTML, like Gecko) SamsungBrowser/9.2 TV Safari/605.1.15"
+            }
             Self::AndroidVr143 => {
                 "com.google.android.apps.youtube.vr.oculus/1.43.32 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)"
             }
             Self::AndroidVr161 => {
                 "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)"
+            }
+            Self::AndroidMobile => {
+                "com.google.android.youtube/21.03.38 (Linux; U; Android 14) gzip"
             }
             Self::Ios => {
                 "com.google.ios.youtube/21.03.1 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X;)"
@@ -151,8 +300,22 @@ impl PlaybackClient {
         }
     }
 
-    fn request_body(self, visitor_data: &str, video_id: &str) -> Value {
+    fn login_supported(self) -> bool {
+        matches!(
+            self,
+            Self::TvHtml5 | Self::TvEmbedded | Self::AndroidCreator | Self::AndroidMobile
+        )
+    }
+
+    fn request_body(self, visitor_data: &str, data_sync_id: Option<&str>, video_id: &str) -> Value {
         let client = match self {
+            Self::TvHtml5 => json!({
+                "clientName": "TVHTML5",
+                "clientVersion": "7.20260213.00.00",
+                "gl": "US",
+                "hl": "en-US",
+                "visitorData": visitor_data,
+            }),
             Self::AndroidVr143 => json!({
                 "clientName": "ANDROID_VR",
                 "clientVersion": "1.43.32",
@@ -173,6 +336,13 @@ impl PlaybackClient {
                 "deviceMake": "Oculus",
                 "deviceModel": "Quest 3",
                 "androidSdkVersion": "32",
+                "gl": "US",
+                "hl": "en-US",
+                "visitorData": visitor_data,
+            }),
+            Self::AndroidMobile => json!({
+                "clientName": "ANDROID",
+                "clientVersion": "21.03.38",
                 "gl": "US",
                 "hl": "en-US",
                 "visitorData": visitor_data,
@@ -209,10 +379,17 @@ impl PlaybackClient {
             }),
         };
 
+        let mut user = json!({});
+        if self.login_supported() {
+            if let Some(data_sync_id) = data_sync_id {
+                user["onBehalfOfUser"] = Value::String(data_sync_id.to_string());
+            }
+        }
+
         let mut body = json!({
             "context": {
                 "client": client,
-                "user": {}
+                "user": user
             },
             "videoId": video_id,
         });
@@ -241,7 +418,7 @@ impl YouTubeClient {
             .unwrap_or_else(|_| Client::new());
         let media_http = Client::builder()
             .connect_timeout(Duration::from_secs(20))
-            .user_agent(PlaybackClient::AndroidVr143.user_agent())
+            .user_agent(LegacyStreamPlaybackClient::AndroidVr143.user_agent())
             .build()
             .unwrap_or_else(|_| Client::new());
 
@@ -252,12 +429,17 @@ impl YouTubeClient {
             stream_cache: HashMap::new(),
             audio_cache: HashMap::new(),
             cookie_header: None,
+            auth_user: None,
             ql,
         }
     }
 
     pub fn set_cookie_header(&mut self, cookie_header: Option<String>) {
         self.cookie_header = cookie_header.filter(|value| !value.trim().is_empty());
+    }
+
+    pub fn set_auth_user(&mut self, auth_user: Option<String>) {
+        self.auth_user = auth_user.filter(|value| !value.trim().is_empty());
     }
 
     pub fn state(&mut self) -> ScState {
@@ -312,6 +494,7 @@ impl YouTubeClient {
         self.stream_cache.clear();
         self.audio_cache.clear();
         self.cookie_header = None;
+        self.auth_user = None;
         Ok(self.state())
     }
 
@@ -349,9 +532,12 @@ impl YouTubeClient {
             return Ok(Vec::new());
         }
 
-        let rsp = self.web_remix_request("music/get_search_suggestions", json!({
-            "input": q,
-        }))?;
+        let rsp = self.web_remix_request(
+            "music/get_search_suggestions",
+            json!({
+                "input": q,
+            }),
+        )?;
         Ok(parse_search_suggestions(&rsp, lim))
     }
 
@@ -373,7 +559,11 @@ impl YouTubeClient {
         let mut items = self.home_feed(home_limit)?;
         if self.authenticated() {
             if let Ok(playlists) = self.library_playlists(playlist_limit) {
-                append_unique_tracks(&mut items, playlists, home_limit.saturating_add(playlist_limit));
+                append_unique_tracks(
+                    &mut items,
+                    playlists,
+                    home_limit.saturating_add(playlist_limit),
+                );
             }
         }
         Ok(items)
@@ -464,77 +654,18 @@ impl YouTubeClient {
             .or_else(|| tr.id.strip_prefix("sc:"))
             .unwrap_or(tr.id.as_str());
 
-        let visitor = self.ensure_visitor_data()?.to_string();
-        let mut last_error: Option<anyhow::Error> = None;
-
-        for client in PlaybackClient::all() {
-            let body = client.request_body(&visitor, video_id);
-            let rsp = self
-                .with_auth(
-                    self.http
-                        .post(format!("{API_BASE}/player?prettyPrint=false")),
-                    true,
-                )
-                .header(ACCEPT, "application/json")
-                .header(CONTENT_TYPE, "application/json")
-                .header("X-Goog-Api-Format-Version", "1")
-                .header("X-YouTube-Client-Name", client.client_id())
-                .header("X-YouTube-Client-Version", client.client_version())
-                .header("X-Origin", MUSIC_ORIGIN)
-                .header("X-Goog-Visitor-Id", &visitor)
-                .header(REFERER, MUSIC_REFERER)
-                .header(USER_AGENT, client.user_agent())
-                .json(&body)
-                .send();
-
-            match rsp {
-                Ok(resp) => {
-                    let json = match resp.error_for_status() {
-                        Ok(resp) => match resp.json::<Value>() {
-                            Ok(json) => json,
-                            Err(err) => {
-                                last_error = Some(err.into());
-                                continue;
-                            }
-                        },
-                        Err(err) => {
-                            last_error = Some(err.into());
-                            continue;
-                        }
-                    };
-                    if playability_status(&json) != Some("OK") {
-                        last_error =
-                            Some(anyhow!(playability_reason(&json).unwrap_or_else(|| {
-                                format!(
-                                    "{} returned {}",
-                                    client.client_name(),
-                                    playability_status(&json).unwrap_or("UNKNOWN")
-                                )
-                            })));
-                        continue;
-                    }
-
-                    if let Some(choice) = pick_audio_stream(&json, self.ql) {
-                        let cached = CachedStream {
-                            url: choice.url.clone(),
-                            expires_at: choice.expires_at,
-                        };
-                        self.stream_cache.insert(tr.id.clone(), cached.clone());
-                        return Ok(ScStream { url: cached.url });
-                    }
-
-                    last_error = Some(anyhow!(
-                        "{} returned no directly playable AAC/MP4 audio formats",
-                        client.client_name()
-                    ));
-                }
-                Err(err) => {
-                    last_error = Some(err.into());
-                }
+        match self
+            .resolve_stream_with_ytdlp(video_id)
+            .or_else(|yt_dlp_err| {
+                self.resolve_stream_with_legacy_pipeline(video_id)
+                    .context(format!("yt-dlp stream resolution failed first: {yt_dlp_err:#}"))
+            }) {
+            Ok(cached) => {
+                self.stream_cache.insert(tr.id.clone(), cached.clone());
+                Ok(ScStream { url: cached.url })
             }
+            Err(err) => Err(err),
         }
-
-        Err(last_error.unwrap_or_else(|| anyhow!("No playable YouTube stream was returned")))
     }
 
     pub fn invalidate_stream(&mut self, track_id: &str) {
@@ -546,6 +677,13 @@ impl YouTubeClient {
         self.audio_cache.remove(track_id)
     }
 
+    pub fn store_cached_audio(&mut self, track_id: &str, bytes: Vec<u8>) {
+        if !self.audio_cache.contains_key(track_id) && self.audio_cache.len() >= 2 {
+            self.audio_cache.clear();
+        }
+        self.audio_cache.insert(track_id.to_string(), bytes);
+    }
+
     pub fn prefetch_track(&mut self, tr: &Track) -> Result<()> {
         if !tr.is_sc() || self.audio_cache.contains_key(&tr.id) {
             return Ok(());
@@ -553,11 +691,7 @@ impl YouTubeClient {
 
         let stream = self.stream(tr)?;
         let bytes = self.download_stream(&stream.url)?;
-
-        if !self.audio_cache.contains_key(&tr.id) && self.audio_cache.len() >= 2 {
-            self.audio_cache.clear();
-        }
-        self.audio_cache.insert(tr.id.clone(), bytes);
+        self.store_cached_audio(&tr.id, bytes);
         Ok(())
     }
 
@@ -586,6 +720,201 @@ impl YouTubeClient {
             .error_for_status()?
             .bytes()?
             .to_vec())
+    }
+
+    fn resolve_stream_with_legacy_pipeline(&mut self, video_id: &str) -> Result<CachedStream> {
+        let visitor = self.ensure_visitor_data()?.to_string();
+        let data_sync_id = self.stream_data_sync_id();
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut attempts = Vec::new();
+
+        for client in LegacyStreamPlaybackClient::all() {
+            let body = client.request_body(&visitor, data_sync_id.as_deref(), video_id);
+            let rsp = self
+                .with_stream_player_auth(
+                    self.http.post(format!("{API_BASE}/player?prettyPrint=false")),
+                    client.login_supported(),
+                )
+                .header(ACCEPT, "application/json")
+                .header(CONTENT_TYPE, "application/json")
+                .header("X-Goog-Api-Format-Version", "1")
+                .header("X-YouTube-Client-Name", client.client_id())
+                .header("X-YouTube-Client-Version", client.client_version())
+                .header("X-Origin", MUSIC_ORIGIN)
+                .header("X-Goog-Visitor-Id", &visitor)
+                .header(REFERER, MUSIC_REFERER)
+                .header(USER_AGENT, client.user_agent())
+                .json(&body)
+                .send();
+
+            match rsp {
+                Ok(resp) => {
+                    let json = match resp.error_for_status() {
+                        Ok(resp) => match resp.json::<Value>() {
+                            Ok(json) => json,
+                            Err(err) => {
+                                attempts.push(format!(
+                                    "{}: could not parse player response: {err}",
+                                    client.client_name()
+                                ));
+                                last_error = Some(err.into());
+                                continue;
+                            }
+                        },
+                        Err(err) => {
+                            attempts.push(format!(
+                                "{}: player request failed: {err}",
+                                client.client_name()
+                            ));
+                            last_error = Some(err.into());
+                            continue;
+                        }
+                    };
+                    if playability_status(&json) != Some("OK") {
+                        let reason = playability_reason(&json).unwrap_or_else(|| {
+                            format!(
+                                "{} returned {}",
+                                client.client_name(),
+                                playability_status(&json).unwrap_or("UNKNOWN")
+                            )
+                        });
+                        let explanation =
+                            explain_playability_reason(reason, self.authenticated());
+                        attempts.push(format!("{}: {explanation}", client.client_name()));
+                        last_error = Some(anyhow!(explanation));
+                        continue;
+                    }
+
+                    if let Some(choice) = pick_audio_stream(&json, self.ql) {
+                        return Ok(CachedStream {
+                            url: choice.url,
+                            expires_at: choice.expires_at,
+                        });
+                    }
+
+                    let message = format!(
+                        "{} returned no directly playable AAC/MP4 audio formats",
+                        client.client_name()
+                    );
+                    attempts.push(message.clone());
+                    last_error = Some(anyhow!(message));
+                }
+                Err(err) => {
+                    attempts.push(format!("{}: {err}", client.client_name()));
+                    last_error = Some(err.into());
+                }
+            }
+        }
+
+        let attempts = attempts.join(" | ");
+        Err(last_error.unwrap_or_else(|| anyhow!("No playable YouTube stream was returned"))
+            .context(format!("stream resolver attempts: {attempts}")))
+    }
+
+    fn resolve_stream_with_ytdlp(&self, video_id: &str) -> Result<CachedStream> {
+        let watch_url = format!("https://www.youtube.com/watch?v={video_id}");
+        let cookie_file = self.write_ytdlp_cookie_file()?;
+        let format = self.ytdlp_format_selector();
+        let output = self
+            .run_ytdlp(&watch_url, format, cookie_file.as_deref())
+            .context("The yt-dlp stream resolver could not obtain a playable audio URL");
+
+        if let Some(path) = cookie_file.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+
+        let output = output?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let url = stdout
+            .lines()
+            .find(|line| line.trim_start().starts_with("http"))
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .context("yt-dlp returned no audio URL")?;
+
+        Ok(CachedStream {
+            url: url.to_string(),
+            expires_at: stream_expiration(url),
+        })
+    }
+
+    fn run_ytdlp(
+        &self,
+        watch_url: &str,
+        format: &str,
+        cookie_file: Option<&std::path::Path>,
+    ) -> Result<std::process::Output> {
+        let mut common_args = vec![
+            "-m".to_string(),
+            "yt_dlp".to_string(),
+            "--js-runtimes".to_string(),
+            "node".to_string(),
+            "--remote-components".to_string(),
+            "ejs:github".to_string(),
+            "--no-playlist".to_string(),
+            "-g".to_string(),
+            "-f".to_string(),
+            format.to_string(),
+        ];
+
+        if let Some(cookie_file) = cookie_file {
+            common_args.push("--cookies".to_string());
+            common_args.push(cookie_file.display().to_string());
+        }
+
+        common_args.push(watch_url.to_string());
+
+        let output = Command::new("python")
+            .args(&common_args)
+            .output()
+            .or_else(|_| {
+                let mut py_args = vec!["-3".to_string()];
+                py_args.extend(common_args.clone());
+                Command::new("py").args(py_args).output()
+            })
+            .context(
+                "Could not start yt-dlp. Install it with `python -m pip install --user yt-dlp`.",
+            )?;
+
+        if output.status.success() {
+            return Ok(output);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow!(stderr.trim().to_string()))
+    }
+
+    fn write_ytdlp_cookie_file(&self) -> Result<Option<std::path::PathBuf>> {
+        let Some(cookie_header) = self.cookie_header.as_deref() else {
+            return Ok(None);
+        };
+
+        let cookie_map = parse_cookie_header(cookie_header);
+        if cookie_map.is_empty() {
+            return Ok(None);
+        }
+
+        let path = std::env::temp_dir().join(format!("rustplayer-ytdlp-{}.cookies", now()));
+        let mut out = String::from("# Netscape HTTP Cookie File\n");
+
+        for (name, value) in cookie_map {
+            out.push_str(&format!(
+                ".youtube.com\tTRUE\t/\tTRUE\t2147483647\t{name}\t{value}\n"
+            ));
+        }
+
+        fs::write(&path, out)
+            .with_context(|| format!("Could not write temporary yt-dlp cookies to {}", path.display()))?;
+        Ok(Some(path))
+    }
+
+    fn ytdlp_format_selector(&self) -> &'static str {
+        match self.ql {
+            Ql::Low => "bestaudio[ext=m4a][abr<=96]/bestaudio[abr<=96]/bestaudio[ext=m4a]/bestaudio",
+            Ql::Med => "bestaudio[ext=m4a][abr<=128]/bestaudio[abr<=128]/bestaudio[ext=m4a]/bestaudio",
+            Ql::High => "bestaudio[ext=m4a]/bestaudio",
+        }
     }
 
     fn ensure_visitor_data(&mut self) -> Result<&str> {
@@ -628,22 +957,23 @@ impl YouTubeClient {
         let visitor = self.ensure_visitor_data()?.to_string();
         let mut last_error: Option<anyhow::Error> = None;
 
-        for client in PlaybackClient::all() {
+        for client in PlaybackClient::candidates(self.authenticated()) {
             let body = client.request_body(&visitor, video_id);
             let rsp = self
-                .with_auth(
+                .with_auth_origin(
                     self.http
-                        .post(format!("{API_BASE}/player?prettyPrint=false")),
-                    true,
+                        .post(format!("{}/player?prettyPrint=false", client.api_base())),
+                    client.supports_cookies(),
+                    client.origin(),
                 )
                 .header(ACCEPT, "application/json")
                 .header(CONTENT_TYPE, "application/json")
                 .header("X-Goog-Api-Format-Version", "1")
                 .header("X-YouTube-Client-Name", client.client_id())
                 .header("X-YouTube-Client-Version", client.client_version())
-                .header("X-Origin", MUSIC_ORIGIN)
+                .header("X-Origin", client.origin())
                 .header("X-Goog-Visitor-Id", &visitor)
-                .header(REFERER, MUSIC_REFERER)
+                .header(REFERER, client.referer())
                 .header(USER_AGENT, client.user_agent())
                 .json(&body)
                 .send();
@@ -663,6 +993,21 @@ impl YouTubeClient {
                             continue;
                         }
                     };
+                    if playability_status(&json).is_some() && playability_status(&json) != Some("OK")
+                    {
+                        let reason = playability_reason(&json).unwrap_or_else(|| {
+                            format!(
+                                "{} returned {}",
+                                client.client_name(),
+                                playability_status(&json).unwrap_or("UNKNOWN")
+                            )
+                        });
+                        last_error = Some(anyhow!(explain_playability_reason(
+                            reason,
+                            self.authenticated()
+                        )));
+                        continue;
+                    }
                     if json.get("videoDetails").is_some() {
                         return Ok(json);
                     }
@@ -679,17 +1024,19 @@ impl YouTubeClient {
     }
 
     fn media_request(&self, url: &str) -> reqwest::blocking::RequestBuilder {
-        self.with_auth(
+        self.with_stream_media_auth(
             self.media_http
                 .get(url)
                 .header(ACCEPT, "*/*")
-                .header(USER_AGENT, PlaybackClient::AndroidVr143.user_agent()),
-            false,
+                .header(
+                    USER_AGENT,
+                    LegacyStreamPlaybackClient::AndroidVr143.user_agent(),
+                ),
         )
     }
 
     fn download_stream_by_range(&self, url: &str) -> Result<Vec<u8>> {
-        let first_end = STREAM_CHUNK_BYTES.saturating_sub(1);
+        let first_end = STREAM_DOWNLOAD_CHUNK_BYTES.saturating_sub(1);
         let first = self
             .media_request(url)
             .header(RANGE, format!("bytes=0-{first_end}"))
@@ -725,7 +1072,7 @@ impl YouTubeClient {
 
         while (out.len() as u64) < total {
             let start = out.len() as u64;
-            let end = (start + STREAM_CHUNK_BYTES - 1).min(total - 1);
+            let end = (start + STREAM_DOWNLOAD_CHUNK_BYTES - 1).min(total - 1);
             let chunk = self
                 .media_request(url)
                 .header(RANGE, format!("bytes={start}-{end}"))
@@ -853,9 +1200,7 @@ impl YouTubeClient {
         if self.authenticated() {
             Ok(())
         } else {
-            Err(anyhow!(
-                "Sign in with YouTube cookies to load {action}"
-            ))
+            Err(anyhow!("Sign in with YouTube cookies to load {action}"))
         }
     }
 
@@ -864,15 +1209,23 @@ impl YouTubeClient {
         builder: reqwest::blocking::RequestBuilder,
         login: bool,
     ) -> reqwest::blocking::RequestBuilder {
+        self.with_auth_origin(builder, login, MUSIC_ORIGIN)
+    }
+
+    fn with_stream_player_auth(
+        &self,
+        builder: reqwest::blocking::RequestBuilder,
+        login_supported: bool,
+    ) -> reqwest::blocking::RequestBuilder {
         let mut builder = builder;
 
-        if let Some(cookie) = self.cookie_header.as_ref() {
-            builder = builder.header("Cookie", cookie);
-            builder = builder.header("X-Goog-AuthUser", "0");
-        }
-
-        if login {
-            if let Some(auth) = self.sapisid_hash() {
+        if login_supported {
+            if let Some(cookie) = self.cookie_header.as_ref() {
+                builder = builder.header("Cookie", cookie);
+            }
+            let auth_user = self.auth_user.as_deref().unwrap_or("0");
+            builder = builder.header("X-Goog-AuthUser", auth_user);
+            if let Some(auth) = self.sapisid_hash(MUSIC_ORIGIN) {
                 builder = builder.header("Authorization", auth);
             }
         }
@@ -880,13 +1233,67 @@ impl YouTubeClient {
         builder
     }
 
-    fn sapisid_hash(&self) -> Option<String> {
+    fn with_stream_media_auth(
+        &self,
+        builder: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        let mut builder = builder;
+
+        if let Some(cookie) = self.cookie_header.as_ref() {
+            builder = builder.header("Cookie", cookie);
+        }
+
+        builder
+    }
+
+    fn stream_data_sync_id(&self) -> Option<String> {
+        let cookie_map = parse_cookie_header(self.cookie_header.as_deref()?);
+        let raw = cookie_map.get("DATASYNC_ID")?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+
+        Some(
+            if !raw.contains("||") {
+                raw.to_string()
+            } else if raw.ends_with("||") {
+                raw.trim_end_matches('|').to_string()
+            } else {
+                raw.split("||").last().unwrap_or(raw).to_string()
+            },
+        )
+    }
+
+    fn with_auth_origin(
+        &self,
+        builder: reqwest::blocking::RequestBuilder,
+        login: bool,
+        origin: &str,
+    ) -> reqwest::blocking::RequestBuilder {
+        let mut builder = builder;
+
+        if let Some(cookie) = self.cookie_header.as_ref() {
+            builder = builder.header("Cookie", cookie);
+            let auth_user = self.auth_user.as_deref().unwrap_or("0");
+            builder = builder.header("X-Goog-AuthUser", auth_user);
+        }
+
+        if login {
+            if let Some(auth) = self.sapisid_hash(origin) {
+                builder = builder.header("Authorization", auth);
+            }
+        }
+
+        builder
+    }
+
+    fn sapisid_hash(&self, origin: &str) -> Option<String> {
         let cookie_map = parse_cookie_header(self.cookie_header.as_deref()?);
         let sapisid = cookie_map
             .get("SAPISID")
             .or_else(|| cookie_map.get("__Secure-3PAPISID"))?;
         let now = now();
-        let hash = sha1_hex(&format!("{now} {sapisid} {MUSIC_ORIGIN}"));
+        let hash = sha1_hex(&format!("{now} {sapisid} {origin}"));
         Some(format!("SAPISIDHASH {now}_{hash}"))
     }
 }
@@ -927,24 +1334,15 @@ fn track_from_responsive_list_renderer(renderer: &Value) -> Option<Track> {
         .map(|runs| subtitle_text_from_runs(runs))
         .filter(|text| !text.is_empty());
 
-    let video_id = renderer
-        .pointer("/playlistItemData/videoId")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            renderer
-                .pointer("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId")
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            renderer
-                .pointer("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint/watchEndpoint/videoId")
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            renderer
-                .pointer("/playButton/playNavigationEndpoint/watchEndpoint/videoId")
-                .and_then(Value::as_str)
-        });
+    let video_id = first_str(renderer, &[
+        "/playlistItemData/videoId",
+        "/playButton/playNavigationEndpoint/watchEndpoint/videoId",
+        "/navigationEndpoint/watchEndpoint/videoId",
+        "/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId",
+        "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint/watchEndpoint/videoId",
+        "/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint/watchEndpoint/videoId",
+    ])
+    .map(|value| value.to_string());
 
     let runs = renderer
         .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/runs")
@@ -964,7 +1362,9 @@ fn track_from_responsive_list_renderer(renderer: &Value) -> Option<Track> {
         .and_then(|text| parse_duration(text))
         .or_else(|| {
             renderer
-                .pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text/runs/0/text")
+                .pointer(
+                    "/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text/runs/0/text",
+                )
                 .and_then(Value::as_str)
                 .and_then(parse_duration)
         });
@@ -1107,7 +1507,8 @@ fn parse_artist_page(rsp: &Value, lim: usize) -> (String, Vec<Track>) {
             let section_title = section_title(section);
             let section_items = section_items(section);
             for item in section_items {
-                let mut track = if let Some(renderer) = item.get("musicResponsiveListItemRenderer") {
+                let mut track = if let Some(renderer) = item.get("musicResponsiveListItemRenderer")
+                {
                     track_from_responsive_list_renderer(renderer)
                 } else if let Some(renderer) = item.get("musicTwoRowItemRenderer") {
                     item_from_two_row_renderer(renderer)
@@ -1345,13 +1746,20 @@ fn item_from_two_row_renderer(renderer: &Value) -> Option<Track> {
         "/navigationEndpoint/watchEndpoint/videoId",
         "/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId",
         "/title/runs/0/navigationEndpoint/watchEndpoint/videoId",
+        "/subtitle/runs/0/navigationEndpoint/watchEndpoint/videoId",
+        "/thumbnailRenderer/musicThumbnailRenderer/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId",
     ]);
     if let Some(video_id) = video_id {
         let subtitle = subtitle_text(renderer.pointer("/subtitle/runs"));
         let duration = renderer
             .pointer("/subtitle/runs")
             .and_then(Value::as_array)
-            .and_then(|runs| split_runs(runs).iter().flatten().find_map(|text| parse_duration(text)));
+            .and_then(|runs| {
+                split_runs(runs)
+                    .iter()
+                    .flatten()
+                    .find_map(|text| parse_duration(text))
+            });
         return Some(Track::new_sc(
             format!("yt:{video_id}"),
             title,
@@ -1438,10 +1846,7 @@ fn pick_audio_stream(player: &Value, ql: Ql) -> Option<AudioChoice> {
             continue;
         }
 
-        let Some(url) = fmt.get("url").and_then(Value::as_str) else {
-            continue;
-        };
-        let url = url.to_string();
+        let url = extract_stream_url(fmt);
         if url.is_empty() {
             continue;
         }
@@ -1488,11 +1893,109 @@ fn pick_audio_stream(player: &Value, ql: Ql) -> Option<AudioChoice> {
     }
 }
 
+fn extract_stream_url(fmt: &Value) -> String {
+    if let Some(url) = fmt.get("url").and_then(Value::as_str) {
+        let url = url.to_string();
+        if !url.is_empty() {
+            return url;
+        }
+    }
+
+    if let Some(cipher) = fmt.get("signatureCipher").and_then(Value::as_str) {
+        if let Some(url) = decode_cipher_url(cipher) {
+            return url;
+        }
+    }
+
+    if let Some(cipher) = fmt.get("cipher").and_then(Value::as_str) {
+        if let Some(url) = decode_cipher_url(cipher) {
+            return url;
+        }
+    }
+
+    String::new()
+}
+
+fn decode_cipher_url(cipher: &str) -> Option<String> {
+    let mut base_url = String::new();
+    let mut signature = None;
+    let mut sp = "signature".to_string();
+
+    for pair in cipher.split('&') {
+        let decoded = percent_decode_str(pair).decode_utf8_lossy();
+        let (key, value) = decoded.split_once('=')?;
+        match key {
+            "url" => base_url = value.to_string(),
+            "s" => signature = Some(value.to_string()),
+            "sp" => sp = value.to_string(),
+            _ => {}
+        }
+    }
+
+    if base_url.is_empty() || signature.is_none() {
+        return None;
+    }
+
+    let signature = signature.unwrap();
+    let decrypted = decrypt_signature(&signature)?;
+
+    let separator = if base_url.contains('?') { "&" } else { "?" };
+    Some(format!("{}{}{}={}", base_url, separator, sp, decrypted))
+}
+
+fn decrypt_signature(sig: &str) -> Option<String> {
+    let sig_chars: Vec<char> = sig.chars().collect();
+    let len = sig_chars.len();
+
+    if len < 2 {
+        return Some(sig.to_string());
+    }
+
+    let mut reversed: Vec<char> = sig_chars.clone();
+    reversed.reverse();
+    let reversed_str: String = reversed.iter().collect();
+
+    if len >= 3 && len <= 4 {
+        let mut result = String::new();
+        for (i, c) in sig_chars.iter().enumerate() {
+            if i % 2 == 0 {
+                result.push(*c);
+            }
+        }
+        return Some(result);
+    }
+
+    let mut result = sig_chars[2..].to_vec();
+    result.push(sig_chars[0]);
+    result.push(sig_chars[1]);
+    let rotated: String = result.iter().collect();
+
+    if len >= 10 {
+        return Some(format!(
+            "{}{}{}",
+            &rotated[..1],
+            &reversed_str[1..len - 1],
+            &rotated[len - 1..]
+        ));
+    }
+
+    Some(format!("{}.{}", reversed_str, &sig[..2]))
+}
+
 fn best_thumbnail(node: Option<&Value>) -> Option<String> {
     node.and_then(Value::as_array)
-        .and_then(|thumbs| thumbs.last())
-        .and_then(|thumb| thumb.get("url"))
-        .and_then(Value::as_str)
+        .and_then(|thumbs| {
+            thumbs
+                .iter()
+                .filter_map(|thumb| {
+                    let url = thumb.get("url").and_then(Value::as_str)?;
+                    let width = thumb.get("width").and_then(Value::as_u64).unwrap_or(0);
+                    let height = thumb.get("height").and_then(Value::as_u64).unwrap_or(0);
+                    Some(((width.saturating_mul(height), width.max(height)), url))
+                })
+                .max_by_key(|((area, edge), _)| (*area, *edge))
+                .map(|(_, url)| url)
+        })
         .map(upgrade_thumbnail_url)
 }
 
@@ -1660,7 +2163,10 @@ fn collect_search_suggestions(
             if let Some(text) = map
                 .get("searchSuggestionRenderer")
                 .and_then(search_suggestion_text)
-                .or_else(|| map.get("historySuggestionRenderer").and_then(search_suggestion_text))
+                .or_else(|| {
+                    map.get("historySuggestionRenderer")
+                        .and_then(search_suggestion_text)
+                })
             {
                 if seen.insert(text.clone()) {
                     out.push(text);
@@ -1702,7 +2208,8 @@ fn search_suggestion_text(renderer: &Value) -> Option<String> {
 }
 
 fn is_artist_page(rsp: &Value) -> bool {
-    rsp.pointer("/header/musicImmersiveHeaderRenderer").is_some()
+    rsp.pointer("/header/musicImmersiveHeaderRenderer")
+        .is_some()
 }
 
 fn artist_page_title(rsp: &Value) -> Option<String> {
@@ -1732,6 +2239,18 @@ fn playability_reason(player: &Value) -> Option<String> {
         .pointer("/playabilityStatus/reason")
         .and_then(Value::as_str)
         .map(|v| v.to_string())
+}
+
+fn explain_playability_reason(reason: String, authenticated: bool) -> String {
+    if authenticated || !reason.to_ascii_lowercase().contains("not a bot") {
+        return reason;
+    }
+
+    format!(
+        "{reason}. YouTube is blocking guest playback. Import YouTube browser headers with \
+         'rustplayer auth headers-file headers.json'. On Windows, Chromium browser cookies may \
+         also require running RustPlayer as Administrator before they can be reused automatically."
+    )
 }
 
 fn stream_expiration(url: &str) -> u64 {
@@ -1900,8 +2419,7 @@ mod tests {
 
     #[test]
     fn thumbnail_upgrade_prefers_higher_res_google_images() {
-        let url =
-            "https://lh3.googleusercontent.com/abc=w120-h120-l90-rj";
+        let url = "https://lh3.googleusercontent.com/abc=w120-h120-l90-rj";
         assert_eq!(
             upgrade_thumbnail_url(url),
             "https://lh3.googleusercontent.com/abc=w1200-h1200-l90-rj"

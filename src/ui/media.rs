@@ -1,7 +1,7 @@
 use super::ScReq;
 use anyhow::Result;
 use crossterm::{
-    cursor::{MoveTo, RestorePosition, SavePosition},
+    cursor::{RestorePosition, SavePosition},
     queue,
 };
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
@@ -14,6 +14,48 @@ use std::sync::mpsc::Sender;
 const CELL_PX: u32 = 10;
 const ART_BG: [u8; 3] = [12, 14, 18];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArtRenderer {
+    Off,
+    Sixel,
+    Wimg,
+    Blocks,
+}
+
+impl ArtRenderer {
+    fn from_env() -> Self {
+        if let Ok(value) = env::var("RUSTPLAYER_ART") {
+            let value = value.trim().to_ascii_lowercase();
+            return match value.as_str() {
+                "off" | "0" | "false" => Self::Off,
+                "sixel" => Self::Sixel,
+                "wimg" => Self::Wimg,
+                "blocks" | "block" => Self::Blocks,
+                _ => Self::auto_detect(),
+            };
+        }
+
+        Self::auto_detect()
+    }
+
+    fn auto_detect() -> Self {
+        if sixel_on() {
+            Self::Sixel
+        } else {
+            Self::Blocks
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Sixel => "sixel",
+            Self::Wimg => "wimg",
+            Self::Blocks => "blocks",
+        }
+    }
+}
+
 pub struct Media {
     raw: HashMap<String, Vec<u8>>,
     bad: HashSet<String>,
@@ -22,11 +64,23 @@ pub struct Media {
     logo: Vec<u8>,
     sig: String,
     dirty: bool,
-    on: bool,
+    renderer: ArtRenderer,
+    renderer_note: Option<&'static str>,
 }
 
 impl Media {
     pub fn new() -> Self {
+        let requested = ArtRenderer::from_env();
+        let sixel_ready = sixel_on();
+        let (renderer, renderer_note) = match requested {
+            ArtRenderer::Off => (ArtRenderer::Off, None),
+            ArtRenderer::Sixel if sixel_ready => (ArtRenderer::Sixel, None),
+            ArtRenderer::Sixel => (ArtRenderer::Blocks, Some("sixel unavailable")),
+            // `wimg` works well as an external previewer, but its inline ANSI output is not
+            // constrained to a Ratatui widget box. Keep panel rendering box-safe.
+            ArtRenderer::Wimg => (ArtRenderer::Blocks, Some("wimg preview only")),
+            ArtRenderer::Blocks => (ArtRenderer::Blocks, None),
+        };
         Self {
             raw: HashMap::new(),
             bad: HashSet::new(),
@@ -35,7 +89,8 @@ impl Media {
             logo: include_bytes!("../../assets/sc_logo.png").to_vec(),
             sig: String::new(),
             dirty: true,
-            on: sixel_on(),
+            renderer,
+            renderer_note,
         }
     }
 
@@ -44,7 +99,14 @@ impl Media {
     }
 
     pub fn on(&self) -> bool {
-        self.on
+        self.renderer != ArtRenderer::Off
+    }
+
+    pub fn renderer_label(&self) -> String {
+        if let Some(note) = self.renderer_note {
+            return format!("{} ({})", self.renderer.label(), note);
+        }
+        self.renderer.label().to_string()
     }
 
     pub fn want(&mut self, key: &str, url: &str, tx: &Sender<ScReq>) {
@@ -79,15 +141,16 @@ impl Media {
         sc_on: bool,
         hide: bool,
     ) -> Result<()> {
-        if !self.on {
+        if self.renderer == ArtRenderer::Off {
             return Ok(());
         }
         let sig = format!(
-            "{}:{:?}:{:?}:{}",
+            "{}:{:?}:{:?}:{}:{}",
             hide,
             cov.map(|(k, r)| format!("{k}:{}:{}:{}:{}", r.x, r.y, r.width, r.height)),
             logo.map(|r| format!("{}:{}:{}:{}", r.x, r.y, r.width, r.height)),
-            sc_on
+            sc_on,
+            self.renderer.label(),
         );
         if !self.dirty && self.sig == sig {
             return Ok(());
@@ -109,6 +172,8 @@ impl Media {
             if sc_on && !hide {
                 if let Some(frame) = self.frame_logo(rect) {
                     self.draw_frame(rect, &frame)?;
+                } else {
+                    self.draw_blank(rect)?;
                 }
             } else {
                 self.draw_blank(rect)?;
@@ -119,7 +184,32 @@ impl Media {
     }
 
     fn frame(&mut self, key: &str, rect: Rect) -> Option<Vec<u8>> {
-        let ck = format!("cov:{key}:{}x{}", rect.width, rect.height);
+        match self.renderer {
+            ArtRenderer::Off => None,
+            ArtRenderer::Sixel => self.frame_sixel(key, rect),
+            ArtRenderer::Blocks => self.frame_blocks(key, rect),
+            ArtRenderer::Wimg => self.frame_blocks(key, rect),
+        }
+    }
+
+    fn frame_logo(&mut self, rect: Rect) -> Option<Vec<u8>> {
+        match self.renderer {
+            ArtRenderer::Off => None,
+            ArtRenderer::Sixel => self.frame_logo_sixel(rect),
+            ArtRenderer::Wimg | ArtRenderer::Blocks => self.frame_logo_blocks(rect),
+        }
+    }
+
+    fn draw_blank(&self, rect: Rect) -> Result<()> {
+        match self.renderer {
+            ArtRenderer::Off => Ok(()),
+            ArtRenderer::Sixel => self.draw_blank_sixel(rect),
+            ArtRenderer::Wimg | ArtRenderer::Blocks => self.draw_blank_blocks(rect),
+        }
+    }
+
+    fn frame_sixel(&mut self, key: &str, rect: Rect) -> Option<Vec<u8>> {
+        let ck = format!("sixel:cov:{key}:{}x{}", rect.width, rect.height);
         if let Some(buf) = self.enc.get(&ck) {
             return Some(buf.clone());
         }
@@ -130,8 +220,8 @@ impl Media {
         Some(buf)
     }
 
-    fn frame_logo(&mut self, rect: Rect) -> Option<Vec<u8>> {
-        let ck = format!("logo:{}x{}", rect.width, rect.height);
+    fn frame_logo_sixel(&mut self, rect: Rect) -> Option<Vec<u8>> {
+        let ck = format!("sixel:logo:{}x{}", rect.width, rect.height);
         if let Some(buf) = self.enc.get(&ck) {
             return Some(buf.clone());
         }
@@ -141,7 +231,30 @@ impl Media {
         Some(buf)
     }
 
-    fn draw_blank(&self, rect: Rect) -> Result<()> {
+    fn frame_blocks(&mut self, key: &str, rect: Rect) -> Option<Vec<u8>> {
+        let ck = format!("blocks:cov:{key}:{}x{}", rect.width, rect.height);
+        if let Some(buf) = self.enc.get(&ck) {
+            return Some(buf.clone());
+        }
+        let dat = self.raw.get(key)?;
+        let img = image::load_from_memory(dat).ok()?;
+        let buf = enc_blocks(img, rect);
+        self.enc.insert(ck, buf.clone());
+        Some(buf)
+    }
+
+    fn frame_logo_blocks(&mut self, rect: Rect) -> Option<Vec<u8>> {
+        let ck = format!("blocks:logo:{}x{}", rect.width, rect.height);
+        if let Some(buf) = self.enc.get(&ck) {
+            return Some(buf.clone());
+        }
+        let img = image::load_from_memory(&self.logo).ok()?;
+        let buf = enc_blocks(img, rect);
+        self.enc.insert(ck, buf.clone());
+        Some(buf)
+    }
+
+    fn draw_blank_sixel(&self, rect: Rect) -> Result<()> {
         if rect.width < 1 || rect.height < 1 {
             return Ok(());
         }
@@ -151,16 +264,32 @@ impl Media {
         self.out(rect, six.as_bytes())
     }
 
+    fn draw_blank_blocks(&self, rect: Rect) -> Result<()> {
+        if rect.width < 1 || rect.height < 1 {
+            return Ok(());
+        }
+        let buf = enc_blank_blocks(rect);
+        self.out(rect, &buf)
+    }
+
     fn draw_frame(&self, rect: Rect, buf: &[u8]) -> Result<()> {
         self.out(rect, buf)
     }
 
     fn out(&self, rect: Rect, buf: &[u8]) -> Result<()> {
         let mut out = io::stdout();
-        queue!(out, SavePosition, MoveTo(rect.x, rect.y))?;
-        out.write_all(b"\x1b7")?;
-        out.write_all(buf)?;
-        out.write_all(b"\x1b8")?;
+        queue!(out, SavePosition)?;
+        let base_x = rect.x + 1;
+        let base_y = rect.y + 1;
+
+        for (row, line) in buf.split(|byte| *byte == b'\n').enumerate() {
+            if row >= rect.height as usize {
+                break;
+            }
+            out.write_all(&format!("\x1b[{};{}H", base_y + row as u16, base_x).into_bytes())?;
+            out.write_all(line)?;
+        }
+
         queue!(out, RestorePosition)?;
         out.flush()?;
         Ok(())
@@ -178,8 +307,78 @@ fn enc_img(img: DynamicImage, rect: Rect) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn enc_blocks(img: DynamicImage, rect: Rect) -> Vec<u8> {
+    let rgb = fit_to_cells(img, rect);
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+
+    let mut out = String::new();
+    let mut y = 0;
+    while y < h {
+        let mut x = 0;
+        while x < w {
+            let pixels = [
+                rgb.get_pixel(x, y).0,
+                pixel_or_bg(&rgb, x + 1, y),
+                pixel_or_bg(&rgb, x, y + 1),
+                pixel_or_bg(&rgb, x + 1, y + 1),
+            ];
+            let (glyph, fg, bg) = quadrant_cell(&pixels);
+            if glyph == ' ' {
+                out.push_str(&format!("\x1b[48;2;{};{};{}m ", bg[0], bg[1], bg[2]));
+            } else {
+                out.push_str(&format!(
+                    "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m{}",
+                    fg[0], fg[1], fg[2], bg[0], bg[1], bg[2], glyph
+                ));
+            }
+            x += 2;
+        }
+        out.push_str("\x1b[0m");
+        y += 2;
+        if y < h {
+            out.push('\n');
+        }
+    }
+
+    out.into_bytes()
+}
+
+fn enc_blank_blocks(rect: Rect) -> Vec<u8> {
+    let w = rect.width.max(1) as usize;
+    let h = rect.height.max(1) as usize;
+    let mut out = String::new();
+    let fill = format!(
+        "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
+        ART_BG[0], ART_BG[1], ART_BG[2], ART_BG[0], ART_BG[1], ART_BG[2]
+    );
+    for y in 0..h {
+        for _ in 0..w {
+            out.push_str(&fill);
+        }
+        out.push_str("\x1b[0m");
+        if y + 1 < h {
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
+}
+
 fn fit_to_canvas(img: DynamicImage, rect: Rect) -> RgbImage {
     let (canvas_w, canvas_h) = canvas_dimensions(rect);
+    let mut canvas = RgbImage::from_pixel(canvas_w.max(1), canvas_h.max(1), Rgb(ART_BG));
+    let fitted = fit(img, canvas_w, canvas_h).to_rgb8();
+    let (w, h) = fitted.dimensions();
+    let x = canvas_w.saturating_sub(w) / 2;
+    let y = canvas_h.saturating_sub(h) / 2;
+    image::imageops::overlay(&mut canvas, &fitted, x.into(), y.into());
+    canvas
+}
+
+fn fit_to_cells(img: DynamicImage, rect: Rect) -> RgbImage {
+    let (canvas_w, canvas_h) = cell_dimensions(rect);
     let mut canvas = RgbImage::from_pixel(canvas_w.max(1), canvas_h.max(1), Rgb(ART_BG));
     let fitted = fit(img, canvas_w, canvas_h).to_rgb8();
     let (w, h) = fitted.dimensions();
@@ -219,6 +418,103 @@ fn canvas_dimensions(rect: Rect) -> (u32, u32) {
         (rect.width.max(1) as u32) * CELL_PX,
         (rect.height.max(1) as u32) * CELL_PX,
     )
+}
+
+fn cell_dimensions(rect: Rect) -> (u32, u32) {
+    // Render each terminal cell as a 2x2 color quadrant to keep the fallback
+    // path smooth and broadly compatible across terminal fonts.
+    (
+        rect.width.max(1) as u32 * 2,
+        rect.height.max(1) as u32 * 2,
+    )
+}
+
+fn pixel_or_bg(rgb: &RgbImage, x: u32, y: u32) -> [u8; 3] {
+    if x < rgb.width() && y < rgb.height() {
+        rgb.get_pixel(x, y).0
+    } else {
+        ART_BG
+    }
+}
+
+fn quadrant_cell(pixels: &[[u8; 3]; 4]) -> (char, [u8; 3], [u8; 3]) {
+    let mut best_mask = 0u8;
+    let mut best_fg = avg_rgb4(pixels, 0b1111);
+    let mut best_bg = best_fg;
+    let mut best_err = u32::MAX;
+
+    for mask in 0u8..=0b1111 {
+        let fg = avg_rgb4(pixels, mask);
+        let bg = avg_rgb4(pixels, !mask & 0b1111);
+        let mut err = 0u32;
+
+        for (idx, pixel) in pixels.iter().enumerate() {
+            let target = if mask & (1 << idx) != 0 { fg } else { bg };
+            err = err.saturating_add(rgb_dist2(*pixel, target));
+        }
+
+        if err < best_err {
+            best_err = err;
+            best_mask = mask;
+            best_fg = fg;
+            best_bg = bg;
+        }
+    }
+
+    (quadrant_glyph(best_mask), best_fg, best_bg)
+}
+
+fn avg_rgb4(pixels: &[[u8; 3]; 4], mask: u8) -> [u8; 3] {
+    let mut sum = [0u32; 3];
+    let mut count = 0u32;
+
+    for (idx, pixel) in pixels.iter().enumerate() {
+        if mask & (1 << idx) == 0 {
+            continue;
+        }
+        sum[0] += pixel[0] as u32;
+        sum[1] += pixel[1] as u32;
+        sum[2] += pixel[2] as u32;
+        count += 1;
+    }
+
+    if count == 0 {
+        return ART_BG;
+    }
+
+    [
+        (sum[0] / count) as u8,
+        (sum[1] / count) as u8,
+        (sum[2] / count) as u8,
+    ]
+}
+
+fn rgb_dist2(a: [u8; 3], b: [u8; 3]) -> u32 {
+    let dr = a[0] as i32 - b[0] as i32;
+    let dg = a[1] as i32 - b[1] as i32;
+    let db = a[2] as i32 - b[2] as i32;
+    (dr * dr + dg * dg + db * db) as u32
+}
+
+fn quadrant_glyph(mask: u8) -> char {
+    match mask & 0b1111 {
+        0b0000 => ' ',
+        0b0001 => '▘',
+        0b0010 => '▝',
+        0b0011 => '▀',
+        0b0100 => '▖',
+        0b0101 => '▌',
+        0b0110 => '▞',
+        0b0111 => '▛',
+        0b1000 => '▗',
+        0b1001 => '▚',
+        0b1010 => '▐',
+        0b1011 => '▜',
+        0b1100 => '▄',
+        0b1101 => '▙',
+        0b1110 => '▟',
+        _ => '█',
+    }
 }
 
 fn enc_six(rgb: &[u8], w: usize, h: usize, max_pal: usize) -> String {
@@ -339,9 +635,6 @@ fn sixel_on() -> bool {
         }
     }
 
-    if env::var_os("WT_SESSION").is_some() {
-        return true;
-    }
-
     false
 }
+
