@@ -79,6 +79,49 @@ impl PlaylistStore {
         playlist.tracks.push(track);
         Ok(playlist.tracks.len())
     }
+
+    pub fn import_remote(
+        &mut self,
+        name: &str,
+        tracks: Vec<Track>,
+        remote_url: String,
+    ) -> Result<usize> {
+        let name = clean_name(name)?;
+        let count = tracks.len();
+        let key = playlist_key(&name);
+        if self.playlists.contains_key(&key) {
+            return Err(anyhow!(
+                "Playlist '{}' already exists; use playlist sync to refresh it",
+                name
+            ));
+        }
+        self.playlists.insert(
+            key,
+            Playlist {
+                name,
+                tracks,
+                remote_url: Some(remote_url),
+            },
+        );
+        Ok(count)
+    }
+
+    pub fn sync_remote(
+        &mut self,
+        name: &str,
+        tracks: Vec<Track>,
+        remote_url: String,
+    ) -> Result<usize> {
+        let name = clean_name(name)?;
+        let key = playlist_key(&name);
+        let playlist = self
+            .playlists
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("Playlist '{}' does not exist", name))?;
+        playlist.tracks = tracks;
+        playlist.remote_url = Some(remote_url);
+        Ok(playlist.tracks.len())
+    }
 }
 
 fn clean_name(name: &str) -> Result<String> {

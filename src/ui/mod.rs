@@ -2,8 +2,9 @@ use crate::appdata::{AppConfig, AppPaths};
 use crate::auth::{youtube_login_window, AuthSession};
 use crate::core::track::{Acc, Track};
 use crate::core::Core;
+use crate::downloads::{download_track, DownloadFormat};
 use crate::playback::{CollectionKind, PlaybackCommand, PlaybackHandle, RepeatMode};
-use crate::sources::soundcloud::{build_auth_link, ScState, SoundCloudClient};
+use crate::sources::soundcloud::{build_auth_link, Ql, ScState, SoundCloudClient};
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind};
 use ratatui::{
     backend::CrosstermBackend,
@@ -34,14 +35,22 @@ pub enum ScReq {
     Login,
     Logout,
     Art(String, String),
+    DownloadTracks(Vec<Track>),
+    DownloadCollection(String, String),
 }
 
 enum ScEvt {
     State(ScState),
     View(String, ViewKind, Result<Vec<Track>, String>),
-    Collection(String, CollectionKind, CollectionAction, Result<Vec<Track>, String>),
+    Collection(
+        String,
+        CollectionKind,
+        CollectionAction,
+        Result<Vec<Track>, String>,
+    ),
     Suggest(String, Result<Vec<String>, String>),
     Art(String, Result<Vec<u8>, String>),
+    Notice(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +129,7 @@ pub struct App {
     art_box: Option<Rect>,
     logo_box: Option<Rect>,
     art_key: Option<String>,
+    prefetch_due: Option<(String, Instant)>,
 }
 
 impl App {
@@ -182,6 +192,7 @@ impl App {
             art_box: None,
             logo_box: None,
             art_key: None,
+            prefetch_due: None,
         }
     }
 
@@ -241,9 +252,9 @@ impl App {
             .sc_ids
             .iter()
             .filter(|id| {
-                self.core
-                    .track(id)
-                    .is_some_and(|track| track.is_playable_remote() && track.acc != Some(Acc::Block))
+                self.core.track(id).is_some_and(|track| {
+                    track.is_playable_remote() && track.acc != Some(Acc::Block)
+                })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -370,6 +381,35 @@ impl App {
 
     fn cur_track(&self) -> Option<Track> {
         self.core.cur_id().and_then(|id| self.core.track(&id))
+    }
+
+    fn download_selected(&mut self) {
+        let Some(track) = self.pick_track().or_else(|| self.cur_track()) else {
+            self.note("select a track or collection to download");
+            return;
+        };
+
+        if track.is_remote_browse() {
+            if track.is_artist_browse() {
+                self.note("artist pages cannot be downloaded as a collection");
+                return;
+            }
+            let Some(browse_id) = track.browse_id() else {
+                self.note("this collection cannot be downloaded");
+                return;
+            };
+            self.sc_busy = true;
+            self.note(format!("downloading {}", track.title));
+            let _ = self.sc.tx.send(ScReq::DownloadCollection(
+                browse_id.to_string(),
+                track.title.clone(),
+            ));
+            return;
+        }
+
+        self.sc_busy = true;
+        self.note(format!("downloading {}", track.title));
+        let _ = self.sc.tx.send(ScReq::DownloadTracks(vec![track]));
     }
 
     fn next_item(&mut self) {
@@ -594,6 +634,13 @@ impl App {
         }
     }
 
+    fn selected_sc_track(&self) -> Option<Track> {
+        (self.md == Mode::Sc)
+            .then(|| self.pick_track())
+            .flatten()
+            .filter(|tr| tr.is_sc())
+    }
+
     fn sel_art(&self) -> Option<Track> {
         if self.md == Mode::Sc {
             if let Some(track) = self.pick_track().filter(|tr| tr.is_sc()) {
@@ -604,18 +651,41 @@ impl App {
         self.cur_track().filter(|tr| tr.is_sc())
     }
 
+    fn overlay_active(&self) -> bool {
+        self.show_help || self.show_dev || self.show_fld || self.inp
+    }
+
     fn sync_art(&mut self) {
         let art = self.sel_art();
         let next = art.as_ref().map(|tr| tr.id.clone());
         if self.art_key != next {
             self.img.mark();
             self.art_key = next;
+            self.prefetch_due = art.as_ref().and_then(|track| {
+                (track.is_playable_remote() && track.acc != Some(Acc::Block)).then(|| {
+                    (
+                        track.id.clone(),
+                        Instant::now() + Duration::from_millis(180),
+                    )
+                })
+            });
         }
         if let Some(tr) = art {
             if let Some(url) = tr.art.clone() {
                 self.img.want(&tr.id, &url, &self.sc.tx);
             }
         }
+    }
+
+    fn poll_prefetch(&mut self) {
+        let Some((track_id, due)) = self.prefetch_due.clone() else {
+            return;
+        };
+        if Instant::now() < due {
+            return;
+        }
+        self.prefetch_due = None;
+        let _ = self.pb.tx.send(PlaybackCommand::PrefetchTrack(track_id));
     }
 
     fn preview_art(&mut self) -> anyhow::Result<()> {
@@ -630,7 +700,10 @@ impl App {
     }
 
     fn set_sc_view(&mut self, title: impl Into<String>, tracks: Vec<Track>) {
-        let ids = tracks.iter().map(|track| track.id.clone()).collect::<Vec<_>>();
+        let ids = tracks
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
         self.core.put_tracks(tracks);
         self.sc_title = title.into();
         self.sc_ids = ids;
@@ -691,14 +764,11 @@ impl App {
         };
         self.push_sc_view();
         self.sc_busy = true;
-        let _ = self
-            .sc
-            .tx
-            .send(ScReq::Browse(
-                browse_id.to_string(),
-                track.title.clone(),
-                browse_hint_from_track(track),
-            ));
+        let _ = self.sc.tx.send(ScReq::Browse(
+            browse_id.to_string(),
+            track.title.clone(),
+            browse_hint_from_track(track),
+        ));
     }
 }
 
@@ -763,6 +833,7 @@ pub fn run_ui(
     let mut app = App::new(core, pb, sc);
     let _ = app.sc.tx.send(ScReq::Init);
     let _ = app.pb.tx.send(PlaybackCommand::ListDevices);
+    let mut overlay_was_active = false;
 
     loop {
         app.clean_msg();
@@ -861,14 +932,25 @@ pub fn run_ui(
                 ScEvt::Art(key, dat) => {
                     app.img.put(key, dat);
                 }
+                ScEvt::Notice(msg) => {
+                    app.sc_busy = false;
+                    app.note(msg);
+                }
             }
         }
 
         app.poll_suggestions();
+        app.poll_prefetch();
         app.sync_art();
+        let overlay_active = app.overlay_active();
+        if overlay_active != overlay_was_active {
+            term.clear()?;
+            app.img.mark();
+            overlay_was_active = overlay_active;
+        }
         term.draw(|f| draw_ui(f, &mut app))?;
 
-        let hide_img = app.show_help || app.show_dev || app.show_fld || app.inp;
+        let hide_img = overlay_active;
         let cov = match (app.art_box, app.art_key.as_deref()) {
             (Some(rect), Some(key)) => Some((key, rect)),
             (Some(rect), None) => Some(("", rect)),
@@ -1026,17 +1108,16 @@ pub fn run_ui(
                         }
                         KeyCode::Char('l') => {
                             if app.md == Mode::Sc {
-                                if app.sc_info.user {
-                                    app.note("signing out of YouTube");
-                                } else {
-                                    app.note("opening the YouTube login window");
-                                }
+                                app.note("opening the YouTube login window");
                                 app.sc_busy = true;
-                                let _ = app.sc.tx.send(if app.sc_info.user {
-                                    ScReq::Logout
-                                } else {
-                                    ScReq::Login
-                                });
+                                let _ = app.sc.tx.send(ScReq::Login);
+                            }
+                        }
+                        KeyCode::Char('L') => {
+                            if app.md == Mode::Sc && app.sc_info.user {
+                                app.note("signing out of YouTube");
+                                app.sc_busy = true;
+                                let _ = app.sc.tx.send(ScReq::Logout);
                             }
                         }
                         KeyCode::Char('g') => {
@@ -1055,11 +1136,13 @@ pub fn run_ui(
                             }
                         }
                         KeyCode::Char('o') => {
-                            if let Some(tr) = app.sel_art() {
+                            if let Some(tr) = app.selected_sc_track() {
                                 if let Some(link) = tr.link {
                                     let _ = webbrowser::open(&build_auth_link(&link));
                                     app.note("opened in browser");
                                 }
+                            } else if app.md == Mode::Sc {
+                                app.note("select a YouTube item first");
                             }
                         }
                         KeyCode::Char('i') => {
@@ -1075,6 +1158,7 @@ pub fn run_ui(
                             }
                             app.img.mark();
                         }
+                        KeyCode::Char('D') => app.download_selected(),
                         KeyCode::Char(' ') => {
                             let _ = app.pb.tx.send(PlaybackCommand::Pause);
                         }
@@ -1203,11 +1287,22 @@ fn clear_auth_session(
     let first = clients
         .first()
         .ok_or_else(|| "No YouTube client is available".to_string())?;
-    let state = first.lock().unwrap().logout().map_err(|err| err.to_string())?;
+    let state = first
+        .lock()
+        .unwrap()
+        .logout()
+        .map_err(|err| err.to_string())?;
     for client in clients.iter().skip(1) {
         let _ = client.lock().unwrap().logout();
     }
     Ok(state)
+}
+
+fn make_client_from_cfg(cfg: &AppConfig) -> Result<SoundCloudClient, String> {
+    let mut client = SoundCloudClient::new(Ql::parse(&cfg.quality));
+    client.set_cookie_header(cfg.cookie_header().map_err(|err| err.to_string())?);
+    client.set_auth_user(cfg.youtube_auth_user.clone());
+    Ok(client)
 }
 
 fn start_sc(
@@ -1305,7 +1400,8 @@ fn start_sc(
                                 ));
                                 continue;
                             }
-                            let _ = etx.send(ScEvt::Collection(view_title, kind, action, Ok(items)));
+                            let _ =
+                                etx.send(ScEvt::Collection(view_title, kind, action, Ok(items)));
                         }
                         Err(err) => {
                             let _ = etx.send(ScEvt::Collection(title, kind, action, Err(err)));
@@ -1347,11 +1443,8 @@ fn start_sc(
                                 .unwrap()
                                 .account_feed(28, 12)
                                 .map_err(|e| e.to_string());
-                            let _ = etx.send(ScEvt::View(
-                                "Home".to_string(),
-                                ViewKind::Generic,
-                                res,
-                            ));
+                            let _ =
+                                etx.send(ScEvt::View("Home".to_string(), ViewKind::Generic, res));
                         }
                         Err(e) => {
                             let mut st = sc.lock().unwrap().state();
@@ -1371,11 +1464,8 @@ fn start_sc(
                                 .unwrap()
                                 .account_feed(28, 12)
                                 .map_err(|e| e.to_string());
-                            let _ = etx.send(ScEvt::View(
-                                "Home".to_string(),
-                                ViewKind::Generic,
-                                res,
-                            ));
+                            let _ =
+                                etx.send(ScEvt::View("Home".to_string(), ViewKind::Generic, res));
                         }
                         Err(e) => {
                             let mut st = sc.lock().unwrap().state();
@@ -1388,6 +1478,63 @@ fn start_sc(
                     let dat = sc.lock().unwrap().art(&url).map_err(|e| e.to_string());
                     let _ = etx.send(ScEvt::Art(key, dat));
                 }
+                ScReq::DownloadTracks(tracks) => {
+                    let cfg_snapshot = cfg.lock().unwrap().clone();
+                    let out_dir = cfg_snapshot.effective_downloads_dir(&paths);
+                    let res = make_client_from_cfg(&cfg_snapshot).and_then(|mut client| {
+                        let total = tracks.len();
+                        for track in &tracks {
+                            download_track(track, &mut client, DownloadFormat::M4a, &out_dir)
+                                .map_err(|err| err.to_string())?;
+                        }
+                        Ok(format!(
+                            "downloaded {} item(s) to {}",
+                            total,
+                            out_dir.display()
+                        ))
+                    });
+                    let _ = etx.send(ScEvt::Notice(match res {
+                        Ok(msg) => msg,
+                        Err(err) => err,
+                    }));
+                }
+                ScReq::DownloadCollection(id, fallback_title) => {
+                    let cfg_snapshot = cfg.lock().unwrap().clone();
+                    let out_dir = cfg_snapshot.effective_downloads_dir(&paths);
+                    let res = make_client_from_cfg(&cfg_snapshot).and_then(|mut client| {
+                        let (title, items) = client
+                            .browse_page(&id, 200)
+                            .map_err(|err| err.to_string())?;
+                        let playable = items
+                            .into_iter()
+                            .filter(|track| {
+                                track.is_playable_remote() && track.acc != Some(Acc::Block)
+                            })
+                            .collect::<Vec<_>>();
+                        if playable.is_empty() {
+                            return Err("no playable tracks were found in that collection".into());
+                        }
+                        let total = playable.len();
+                        for track in &playable {
+                            download_track(track, &mut client, DownloadFormat::M4a, &out_dir)
+                                .map_err(|err| err.to_string())?;
+                        }
+                        Ok(format!(
+                            "downloaded {} track(s) from {} to {}",
+                            total,
+                            if title.trim().is_empty() {
+                                fallback_title
+                            } else {
+                                title
+                            },
+                            out_dir.display()
+                        ))
+                    });
+                    let _ = etx.send(ScEvt::Notice(match res {
+                        Ok(msg) => msg,
+                        Err(err) => err,
+                    }));
+                }
             }
         }
     });
@@ -1396,6 +1543,8 @@ fn start_sc(
 
 fn draw_ui(f: &mut Frame, app: &mut App) {
     let size = f.area();
+    app.art_box = None;
+    app.logo_box = None;
     f.render_widget(
         Block::default().style(
             Style::default()
@@ -1413,27 +1562,40 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         ])
         .split(size);
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(root[1]);
-
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(44),
-            Constraint::Percentage(31),
-            Constraint::Percentage(25),
-        ])
-        .split(body[1]);
-
     draw_head(f, app, root[0]);
-    draw_list_box(f, app, body[0]);
-    draw_art_box(f, app, right[0]);
-    draw_info_box(f, app, right[1]);
-    draw_tail_box(f, app, right[2]);
+    if app.overlay_active() {
+        draw_list_box(f, app, root[1]);
+    } else {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(root[1]);
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(if app.show_viz {
+                [
+                    Constraint::Percentage(38),
+                    Constraint::Percentage(24),
+                    Constraint::Percentage(38),
+                ]
+            } else {
+                [
+                    Constraint::Percentage(44),
+                    Constraint::Percentage(31),
+                    Constraint::Percentage(25),
+                ]
+            })
+            .split(body[1]);
+        draw_list_box(f, app, body[0]);
+        draw_art_box(f, app, right[0]);
+        draw_info_box(f, app, right[1]);
+        draw_tail_box(f, app, right[2]);
+    }
     draw_foot(f, app, root[2]);
 
+    if app.show_help || app.show_dev || app.show_fld {
+        draw_overlay_backdrop(f, size);
+    }
     if app.show_help {
         draw_help(f, size);
     }
@@ -1446,6 +1608,14 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     if app.inp {
         draw_inp(f, app, size);
     }
+}
+
+fn draw_overlay_backdrop(f: &mut Frame, area: Rect) {
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(18, 22, 28))),
+        area,
+    );
 }
 
 fn draw_head(f: &mut Frame, app: &App, area: Rect) {
@@ -1644,7 +1814,7 @@ fn draw_art_box(f: &mut Frame, app: &mut App, area: Rect) {
             &[
                 "Artwork disabled",
                 "set RUSTPLAYER_ART=blocks",
-                "or set RUSTPLAYER_ART=sixel",
+                "or set RUSTPLAYER_ART=sixel/wimg",
             ],
             Alignment::Left,
         );
@@ -1781,7 +1951,11 @@ fn draw_info_box(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw(" "),
             pill(
-                if app.shuffle_on { "SHUFFLE ON" } else { "SHUFFLE OFF" },
+                if app.shuffle_on {
+                    "SHUFFLE ON"
+                } else {
+                    "SHUFFLE OFF"
+                },
                 if app.shuffle_on {
                     Color::LightCyan
                 } else {
@@ -1869,7 +2043,9 @@ fn draw_info_box(f: &mut Frame, app: &App, area: Rect) {
                     },
                     Style::default().fg(Color::Rgb(104, 113, 124)),
                 )));
-            } else if matches!(app.sc_view_kind, ViewKind::Collection(_)) && sel.is_playable_remote() {
+            } else if matches!(app.sc_view_kind, ViewKind::Collection(_))
+                && sel.is_playable_remote()
+            {
                 lines.push(Line::from(Span::styled(
                     "Enter plays from here and queues the rest of this collection",
                     Style::default().fg(Color::Rgb(104, 113, 124)),
@@ -1910,7 +2086,7 @@ fn draw_tail_box(f: &mut Frame, app: &mut App, area: Rect) {
     if app.show_viz && area.height > 8 {
         let sp = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+            .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
             .split(area);
         draw_viz(f, app, sp[0]);
         draw_q(f, app, sp[1]);
@@ -2006,11 +2182,15 @@ fn draw_foot(f: &mut Frame, app: &App, area: Rect) {
         hot("g/m"),
         Span::raw(" home/library  "),
         hot("l"),
-        Span::raw(" session  "),
+        Span::raw(" login  "),
+        hot("L"),
+        Span::raw(" sign out  "),
         hot("o"),
         Span::raw(" open  "),
         hot("i"),
-        Span::raw(" art  "),
+        Span::raw(" art preview  "),
+        hot("D"),
+        Span::raw(" download  "),
         hot("q"),
         Span::raw(" quit  "),
         Span::styled(msg, Style::default().fg(Color::Green)),
@@ -2043,9 +2223,11 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("R cycle repeat off/all/one, z toggle playlist shuffle"),
         Line::from("left/right seek 5s, b/f seek 30s"),
         Line::from("o open selected youtube link"),
-        Line::from("i preview selected artwork with wimg"),
+        Line::from("i preview selected artwork, or now playing art, with wimg"),
+        Line::from("D download selected track, or selected playlist/album as m4a"),
+        Line::from("right artwork = now playing"),
         Line::from("g load youtube home, m load account playlists, u go back"),
-        Line::from("A toggle autoplay, l open YouTube login or sign out"),
+        Line::from("A toggle autoplay, l open YouTube login, L sign out"),
         Line::from("+/- volume, 0 mute"),
         Line::from("d audio devices, F local folders"),
         Line::from("v visualizer, j/k move, J/K queue"),
@@ -2055,6 +2237,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             Style::default().fg(Color::Yellow).bold(),
         )),
         Line::from("l opens a dedicated YouTube Music login window on Windows"),
+        Line::from("L clears the current in-app YouTube session"),
         Line::from("personalized home and library playlists use the captured session"),
         Line::from("use: rustplayer auth cookie-file <cookies.txt>"),
         Line::from("or : rustplayer auth cookie-header \"SID=...; SAPISID=...\""),
@@ -2150,7 +2333,11 @@ fn draw_fld(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_inp(f: &mut Frame, app: &App, area: Rect) {
-    let sug_h = if app.md == Mode::Sc && !app.sc_sugs.is_empty() { 36 } else { 18 };
+    let sug_h = if app.md == Mode::Sc && !app.sc_sugs.is_empty() {
+        36
+    } else {
+        18
+    };
     let box_a = centered(area, 60, sug_h);
     let ttl = match app.md {
         Mode::Local => " Search Local ",
@@ -2173,7 +2360,10 @@ fn draw_inp(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let lines = vec![
-        Line::from(Span::styled(hint, Style::default().fg(Color::Rgb(170, 178, 190)))),
+        Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::Rgb(170, 178, 190)),
+        )),
         Line::from(""),
         Line::from(Span::styled(
             format!("> {}", app.qry),

@@ -100,8 +100,10 @@ Artwork inline rendering defaults to ANSI blocks. If you want to try inline wimg
 
 ```bash
 RUSTPLAYER_ART=wimg
-RUSTPLAYER_WIMG_INLINE=1
 ```
+
+If the inline image looks too wide or too short in your terminal, you can tune the
+assumed cell size with `RUSTPLAYER_ART_CELL_W` and `RUSTPLAYER_ART_CELL_H`.
 
 **Track Indicators:**
 - `L` = Local file

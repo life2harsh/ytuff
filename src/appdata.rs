@@ -23,8 +23,8 @@ use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, BOOL, HANDLE};
 use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Security::{
-    DuplicateToken, ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation,
-    TOKEN_DUPLICATE, TOKEN_QUERY,
+    DuplicateToken, ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation, TOKEN_DUPLICATE,
+    TOKEN_QUERY,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::ProcessStatus::{EnumProcesses, K32GetProcessImageFileNameW};
@@ -409,7 +409,10 @@ with tempfile.TemporaryDirectory(prefix="rustplayer-cookies-") as tmp:
 }
 
 #[cfg(target_os = "windows")]
-fn cookie_header_from_browser(keys: &ChromiumKeys, cookies: Vec<ChromiumCookieRow>) -> Option<String> {
+fn cookie_header_from_browser(
+    keys: &ChromiumKeys,
+    cookies: Vec<ChromiumCookieRow>,
+) -> Option<String> {
     let mut best = BTreeMap::<String, (u8, String)>::new();
 
     for cookie in cookies {
@@ -530,8 +533,7 @@ fn crypt_unprotect(data: &[u8]) -> Option<Vec<u8>> {
             return None;
         }
 
-        let bytes =
-            std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
+        let bytes = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
         LocalFree(out_blob.pbData.cast());
         Some(bytes)
     }
@@ -622,7 +624,8 @@ fn process_name(pid: u32) -> Option<String> {
     }
 
     let mut buffer = vec![0u16; 260];
-    let len = unsafe { K32GetProcessImageFileNameW(handle, buffer.as_mut_ptr(), buffer.len() as u32) };
+    let len =
+        unsafe { K32GetProcessImageFileNameW(handle, buffer.as_mut_ptr(), buffer.len() as u32) };
     unsafe {
         CloseHandle(handle);
     }

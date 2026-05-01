@@ -47,8 +47,7 @@ mod windows {
     const VIDEO_URL: &str = "https://www.youtube.com";
     const TITLE_WAITING: &str =
         "RustPlayer YouTube Login - sign in, then close this window when you are done";
-    const TITLE_READY: &str =
-        "RustPlayer YouTube Login - signed in, close this window to finish";
+    const TITLE_READY: &str = "RustPlayer YouTube Login - signed in, close this window to finish";
 
     const AUTH_IPC_SCRIPT: &str = r#"
 (() => {
@@ -166,7 +165,10 @@ mod windows {
             let window = match event_loop.create_window(attrs) {
                 Ok(window) => window,
                 Err(err) => {
-                    self.set_outcome(Err(anyhow!("Could not create the YouTube login window: {}", err)));
+                    self.set_outcome(Err(anyhow!(
+                        "Could not create the YouTube login window: {}",
+                        err
+                    )));
                     event_loop.exit();
                     return;
                 }
@@ -208,7 +210,10 @@ mod windows {
             let webview = match builder.build(&window) {
                 Ok(webview) => webview,
                 Err(err) => {
-                    self.set_outcome(Err(anyhow!("Could not start the YouTube login webview: {}", err)));
+                    self.set_outcome(Err(anyhow!(
+                        "Could not start the YouTube login webview: {}",
+                        err
+                    )));
                     event_loop.exit();
                     return;
                 }
@@ -280,11 +285,10 @@ mod windows {
             .run_app(&mut app)
             .context("The YouTube login window terminated unexpectedly")?;
 
-        let result = outcome
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| anyhow!("The YouTube login window closed without returning a result"))?;
+        let result =
+            outcome.lock().unwrap().take().ok_or_else(|| {
+                anyhow!("The YouTube login window closed without returning a result")
+            })?;
 
         thread::sleep(Duration::from_millis(250));
         let _ = fs::remove_dir_all(&profile_dir);
@@ -297,7 +301,9 @@ mod windows {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        paths.cache_dir.join(format!("youtube-login-webview-{stamp}"))
+        paths
+            .cache_dir
+            .join(format!("youtube-login-webview-{stamp}"))
     }
 
     fn collect_auth_session(webview: &WebView) -> Result<AuthSession> {
@@ -337,7 +343,9 @@ mod windows {
             .join("; ");
 
         if header.trim().is_empty() {
-            Err(anyhow!("No YouTube Music cookies were captured from the login window"))
+            Err(anyhow!(
+                "No YouTube Music cookies were captured from the login window"
+            ))
         } else {
             Ok(header)
         }

@@ -1,5 +1,5 @@
-mod auth;
 mod appdata;
+mod auth;
 mod core;
 mod daemon;
 mod downloads;
@@ -12,7 +12,7 @@ mod ui;
 
 use crate::appdata::{AppConfig, AppPaths};
 use crate::auth::youtube_login_window;
-use crate::core::track::Track;
+use crate::core::track::{Acc, Track};
 use crate::core::Core;
 use crate::daemon::{send_request, RpcRequest};
 use crate::downloads::{download_track, DownloadFormat};
@@ -25,7 +25,10 @@ use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Mutex};
+use url::Url;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -125,6 +128,14 @@ enum PlaylistCommand {
     Add {
         name: String,
         input: String,
+    },
+    Import {
+        input: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Sync {
+        name: String,
     },
     Play {
         name: String,
@@ -255,10 +266,7 @@ fn main() -> Result<()> {
         Some(Command::Startup { state }) => {
             runtime.cfg.start_background_on_boot = state.is_on();
             runtime.persist()?;
-            println!(
-                "startup preference {}",
-                if state.is_on() { "enabled" } else { "disabled" }
-            );
+            println!("{}", configure_startup(state.is_on())?);
             Ok(())
         }
         Some(Command::Config) => print_json_or_text(&runtime.cfg, cli.json, || {
@@ -278,6 +286,12 @@ fn main() -> Result<()> {
 struct Runtime {
     paths: AppPaths,
     cfg: AppConfig,
+}
+
+struct RemoteCollection {
+    title: String,
+    tracks: Vec<Track>,
+    source_url: String,
 }
 
 impl Runtime {
@@ -334,6 +348,88 @@ impl Runtime {
         let core = self.build_core();
         let mut client = self.make_client()?;
         resolve::resolve_input(&core, &mut client, input)
+    }
+}
+
+fn resolve_remote_collection(runtime: &Runtime, input: &str) -> Result<RemoteCollection> {
+    let browse_id = remote_browse_id(input).ok_or_else(|| anyhow!("not a remote collection"))?;
+    let mut client = runtime.make_client()?;
+    let (title, items) = client.browse_page(&browse_id, 200)?;
+    let tracks = items
+        .into_iter()
+        .filter(|track| track.is_playable_remote() && track.acc != Some(Acc::Block))
+        .collect::<Vec<_>>();
+    if tracks.is_empty() {
+        return Err(anyhow!("No playable tracks were found in that collection"));
+    }
+
+    let source_url = remote_collection_url(input, &browse_id);
+    let title = if title.trim().is_empty() {
+        source_url.clone()
+    } else {
+        title
+    };
+
+    Ok(RemoteCollection {
+        title,
+        tracks,
+        source_url,
+    })
+}
+
+fn remote_browse_id(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("ytb:") || trimmed.starts_with("VL") || trimmed.starts_with("MPRE") {
+        return Some(normalize_browse_id(trimmed));
+    }
+
+    let url = Url::parse(trimmed).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if !host.contains("youtube.com") && !host.contains("youtu.be") {
+        return None;
+    }
+
+    if let Some(list_id) = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "list").then(|| value.into_owned()))
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(normalize_browse_id(&list_id));
+    }
+
+    let mut segments = url.path_segments()?;
+    match (segments.next(), segments.next()) {
+        (Some("browse"), Some(id)) if !id.trim().is_empty() => Some(normalize_browse_id(id)),
+        _ => None,
+    }
+}
+
+fn normalize_browse_id(raw: &str) -> String {
+    let raw = raw.trim().trim_start_matches("ytb:");
+    if raw.starts_with("VL")
+        || raw.starts_with("MPRE")
+        || raw.starts_with("MPLA")
+        || raw.starts_with("UC")
+        || raw.starts_with("FEmusic_")
+    {
+        raw.to_string()
+    } else {
+        format!("VL{raw}")
+    }
+}
+
+fn remote_collection_url(input: &str, browse_id: &str) -> String {
+    let trimmed = input.trim();
+    if Url::parse(trimmed).is_ok() {
+        return trimmed.to_string();
+    }
+    if let Some(playlist_id) = browse_id.strip_prefix("VL") {
+        format!("https://music.youtube.com/playlist?list={playlist_id}")
+    } else {
+        format!("https://music.youtube.com/browse/{browse_id}")
     }
 }
 
@@ -491,6 +587,35 @@ fn playlist_command(runtime: &Runtime, command: &PlaylistCommand, json: bool) ->
             println!("playlist '{}' now has {} track(s)", name, count);
             Ok(())
         }
+        PlaylistCommand::Import { input, name } => {
+            let remote = resolve_remote_collection(runtime, input)?;
+            let playlist_name = name
+                .clone()
+                .unwrap_or_else(|| remote.title.clone())
+                .trim()
+                .to_string();
+            let mut store = PlaylistStore::load(&runtime.paths)?;
+            let count =
+                store.import_remote(&playlist_name, remote.tracks, remote.source_url.clone())?;
+            store.save(&runtime.paths)?;
+            println!(
+                "imported {} track(s) into '{}' from {}",
+                count, playlist_name, remote.source_url
+            );
+            Ok(())
+        }
+        PlaylistCommand::Sync { name } => {
+            let mut store = PlaylistStore::load(&runtime.paths)?;
+            let remote_url = store
+                .playlist(name)
+                .and_then(|playlist| playlist.remote_url.clone())
+                .ok_or_else(|| anyhow!("Playlist '{}' is not linked to a remote playlist", name))?;
+            let remote = resolve_remote_collection(runtime, &remote_url)?;
+            let count = store.sync_remote(name, remote.tracks, remote.source_url)?;
+            store.save(&runtime.paths)?;
+            println!("synced '{}' with {} track(s)", name, count);
+            Ok(())
+        }
         PlaylistCommand::Play { name } => {
             let tracks = playlist_tracks(runtime, name)?;
             send_daemon(runtime, &RpcRequest::PlayTracks { tracks })?;
@@ -559,11 +684,21 @@ fn download_input(
     format: DownloadFormat,
     output: Option<&Path>,
 ) -> Result<()> {
-    let track = runtime.resolve_track(input)?;
-    let mut client = runtime.make_client()?;
     let out_dir = output
         .map(Path::to_path_buf)
         .unwrap_or_else(|| runtime.cfg.effective_downloads_dir(&runtime.paths));
+
+    if let Ok(collection) = resolve_remote_collection(runtime, input) {
+        let mut client = runtime.make_client()?;
+        for track in &collection.tracks {
+            let path = download_track(track, &mut client, format, &out_dir)?;
+            println!("{}", path.display());
+        }
+        return Ok(());
+    }
+
+    let track = runtime.resolve_track(input)?;
+    let mut client = runtime.make_client()?;
     let path = download_track(&track, &mut client, format, &out_dir)?;
     println!("{}", path.display());
     Ok(())
@@ -690,9 +825,14 @@ fn auth_command(runtime: &mut Runtime, command: &AuthCommand, json: bool) -> Res
             let browser_cookie_fallback = runtime.cfg.youtube_cookie_file.is_none()
                 && !configured_cookie_header
                 && effective_cookie_header.is_some();
-            let effective_auth_user = effective_cookie_header
-                .as_ref()
-                .map(|_| runtime.cfg.youtube_auth_user.as_deref().unwrap_or("0").to_string());
+            let effective_auth_user = effective_cookie_header.as_ref().map(|_| {
+                runtime
+                    .cfg
+                    .youtube_auth_user
+                    .as_deref()
+                    .unwrap_or("0")
+                    .to_string()
+            });
             let state = runtime.make_client()?.state();
             let payload = serde_json::json!({
                 "cookie_file": runtime.cfg.youtube_cookie_file,
@@ -709,18 +849,10 @@ fn auth_command(runtime: &mut Runtime, command: &AuthCommand, json: bool) -> Res
                 let source = if let Some(path) = runtime.cfg.youtube_cookie_file.as_ref() {
                     format!("cookie file: {} (account not verified)", path.display())
                 } else if configured_cookie_header {
-                    let auth_user = runtime
-                        .cfg
-                        .youtube_auth_user
-                        .as_deref()
-                        .unwrap_or("0");
+                    let auth_user = runtime.cfg.youtube_auth_user.as_deref().unwrap_or("0");
                     format!("cookie header: configured (auth user {auth_user})")
                 } else if browser_cookie_fallback {
-                    let auth_user = runtime
-                        .cfg
-                        .youtube_auth_user
-                        .as_deref()
-                        .unwrap_or("0");
+                    let auth_user = runtime.cfg.youtube_auth_user.as_deref().unwrap_or("0");
                     format!(
                         "browser cookies: detected (auth user {auth_user}, browser/profile auto-picked)"
                     )
@@ -777,6 +909,121 @@ fn parse_headers_json(path: &Path) -> Result<(String, Option<String>)> {
 
     let cookie = cookie.ok_or_else(|| anyhow!("Headers file is missing a Cookie header"))?;
     Ok((cookie, auth_user))
+}
+
+fn configure_startup(enabled: bool) -> Result<String> {
+    if enabled {
+        install_startup()?;
+        Ok("startup enabled".to_string())
+    } else {
+        uninstall_startup()?;
+        Ok("startup disabled".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn install_startup() -> Result<()> {
+    let exe = std::env::current_exe().context("Could not resolve current executable")?;
+    let appdata = std::env::var_os("APPDATA").ok_or_else(|| anyhow!("APPDATA is not set"))?;
+    let path = PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup")
+        .join("rustplayer-daemon.cmd");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let script = format!(
+        "@echo off\r\nstart \"RustPlayer\" /min \"{}\" daemon\r\n",
+        exe.display()
+    );
+    fs::write(path, script)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_startup() -> Result<()> {
+    let appdata = std::env::var_os("APPDATA").ok_or_else(|| anyhow!("APPDATA is not set"))?;
+    let path = PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup")
+        .join("rustplayer-daemon.cmd");
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_startup() -> Result<()> {
+    let exe = std::env::current_exe().context("Could not resolve current executable")?;
+    let config_dir = dirs::config_dir().ok_or_else(|| anyhow!("Could not locate config dir"))?;
+    let unit_dir = config_dir.join("systemd").join("user");
+    fs::create_dir_all(&unit_dir)?;
+    let unit_path = unit_dir.join("rustplayer.service");
+    let unit = format!(
+        "[Unit]\nDescription=RustPlayer background daemon\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        shell_escape_arg(&exe.display().to_string())
+    );
+    fs::write(&unit_path, unit)?;
+    let _ = ProcessCommand::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+    let status = ProcessCommand::new("systemctl")
+        .args(["--user", "enable", "--now", "rustplayer.service"])
+        .status();
+    if status.as_ref().is_err() || !status.unwrap().success() {
+        return Err(anyhow!(
+            "Wrote {} but could not enable it with systemctl --user",
+            unit_path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_startup() -> Result<()> {
+    let _ = ProcessCommand::new("systemctl")
+        .args(["--user", "disable", "--now", "rustplayer.service"])
+        .status();
+    if let Some(config_dir) = dirs::config_dir() {
+        let unit_path = config_dir
+            .join("systemd")
+            .join("user")
+            .join("rustplayer.service");
+        if unit_path.exists() {
+            fs::remove_file(unit_path)?;
+        }
+    }
+    let _ = ProcessCommand::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn install_startup() -> Result<()> {
+    Err(anyhow!(
+        "startup integration is not implemented on this platform yet"
+    ))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn uninstall_startup() -> Result<()> {
+    Err(anyhow!(
+        "startup integration is not implemented on this platform yet"
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn shell_escape_arg(value: &str) -> String {
+    let escaped = value.replace('\'', "'\\''");
+    format!("'{}'", escaped)
 }
 
 fn maybe_restart_daemon(runtime: &Runtime) -> Result<()> {
@@ -880,6 +1127,27 @@ fn format_track_line(track: &Track) -> String {
         track.title,
         track.who()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_browse_id_accepts_playlist_urls() {
+        assert_eq!(
+            remote_browse_id("https://music.youtube.com/playlist?list=PL123"),
+            Some("VLPL123".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_browse_id_accepts_browse_urls() {
+        assert_eq!(
+            remote_browse_id("https://music.youtube.com/browse/MPREb_abc"),
+            Some("MPREb_abc".to_string())
+        );
+    }
 }
 
 fn normalize_path(path: &Path) -> Result<PathBuf> {

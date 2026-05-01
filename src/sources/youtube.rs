@@ -658,7 +658,9 @@ impl YouTubeClient {
             .resolve_stream_with_ytdlp(video_id)
             .or_else(|yt_dlp_err| {
                 self.resolve_stream_with_legacy_pipeline(video_id)
-                    .context(format!("yt-dlp stream resolution failed first: {yt_dlp_err:#}"))
+                    .context(format!(
+                        "yt-dlp stream resolution failed first: {yt_dlp_err:#}"
+                    ))
             }) {
             Ok(cached) => {
                 self.stream_cache.insert(tr.id.clone(), cached.clone());
@@ -678,8 +680,10 @@ impl YouTubeClient {
     }
 
     pub fn store_cached_audio(&mut self, track_id: &str, bytes: Vec<u8>) {
-        if !self.audio_cache.contains_key(track_id) && self.audio_cache.len() >= 2 {
-            self.audio_cache.clear();
+        if !self.audio_cache.contains_key(track_id) && self.audio_cache.len() >= 4 {
+            if let Some(oldest_key) = self.audio_cache.keys().next().cloned() {
+                self.audio_cache.remove(&oldest_key);
+            }
         }
         self.audio_cache.insert(track_id.to_string(), bytes);
     }
@@ -732,7 +736,8 @@ impl YouTubeClient {
             let body = client.request_body(&visitor, data_sync_id.as_deref(), video_id);
             let rsp = self
                 .with_stream_player_auth(
-                    self.http.post(format!("{API_BASE}/player?prettyPrint=false")),
+                    self.http
+                        .post(format!("{API_BASE}/player?prettyPrint=false")),
                     client.login_supported(),
                 )
                 .header(ACCEPT, "application/json")
@@ -778,8 +783,7 @@ impl YouTubeClient {
                                 playability_status(&json).unwrap_or("UNKNOWN")
                             )
                         });
-                        let explanation =
-                            explain_playability_reason(reason, self.authenticated());
+                        let explanation = explain_playability_reason(reason, self.authenticated());
                         attempts.push(format!("{}: {explanation}", client.client_name()));
                         last_error = Some(anyhow!(explanation));
                         continue;
@@ -807,7 +811,8 @@ impl YouTubeClient {
         }
 
         let attempts = attempts.join(" | ");
-        Err(last_error.unwrap_or_else(|| anyhow!("No playable YouTube stream was returned"))
+        Err(last_error
+            .unwrap_or_else(|| anyhow!("No playable YouTube stream was returned"))
             .context(format!("stream resolver attempts: {attempts}")))
     }
 
@@ -904,15 +909,23 @@ impl YouTubeClient {
             ));
         }
 
-        fs::write(&path, out)
-            .with_context(|| format!("Could not write temporary yt-dlp cookies to {}", path.display()))?;
+        fs::write(&path, out).with_context(|| {
+            format!(
+                "Could not write temporary yt-dlp cookies to {}",
+                path.display()
+            )
+        })?;
         Ok(Some(path))
     }
 
     fn ytdlp_format_selector(&self) -> &'static str {
         match self.ql {
-            Ql::Low => "bestaudio[ext=m4a][abr<=96]/bestaudio[abr<=96]/bestaudio[ext=m4a]/bestaudio",
-            Ql::Med => "bestaudio[ext=m4a][abr<=128]/bestaudio[abr<=128]/bestaudio[ext=m4a]/bestaudio",
+            Ql::Low => {
+                "bestaudio[ext=m4a][abr<=96]/bestaudio[abr<=96]/bestaudio[ext=m4a]/bestaudio"
+            }
+            Ql::Med => {
+                "bestaudio[ext=m4a][abr<=128]/bestaudio[abr<=128]/bestaudio[ext=m4a]/bestaudio"
+            }
             Ql::High => "bestaudio[ext=m4a]/bestaudio",
         }
     }
@@ -993,7 +1006,8 @@ impl YouTubeClient {
                             continue;
                         }
                     };
-                    if playability_status(&json).is_some() && playability_status(&json) != Some("OK")
+                    if playability_status(&json).is_some()
+                        && playability_status(&json) != Some("OK")
                     {
                         let reason = playability_reason(&json).unwrap_or_else(|| {
                             format!(
@@ -1024,15 +1038,10 @@ impl YouTubeClient {
     }
 
     fn media_request(&self, url: &str) -> reqwest::blocking::RequestBuilder {
-        self.with_stream_media_auth(
-            self.media_http
-                .get(url)
-                .header(ACCEPT, "*/*")
-                .header(
-                    USER_AGENT,
-                    LegacyStreamPlaybackClient::AndroidVr143.user_agent(),
-                ),
-        )
+        self.with_stream_media_auth(self.media_http.get(url).header(ACCEPT, "*/*").header(
+            USER_AGENT,
+            LegacyStreamPlaybackClient::AndroidVr143.user_agent(),
+        ))
     }
 
     fn download_stream_by_range(&self, url: &str) -> Result<Vec<u8>> {
@@ -1253,15 +1262,13 @@ impl YouTubeClient {
             return None;
         }
 
-        Some(
-            if !raw.contains("||") {
-                raw.to_string()
-            } else if raw.ends_with("||") {
-                raw.trim_end_matches('|').to_string()
-            } else {
-                raw.split("||").last().unwrap_or(raw).to_string()
-            },
-        )
+        Some(if !raw.contains("||") {
+            raw.to_string()
+        } else if raw.ends_with("||") {
+            raw.trim_end_matches('|').to_string()
+        } else {
+            raw.split("||").last().unwrap_or(raw).to_string()
+        })
     }
 
     fn with_auth_origin(
@@ -2122,20 +2129,23 @@ fn browse_link(browse_id: &str) -> String {
 }
 
 fn upgrade_thumbnail_url(url: &str) -> String {
+    const GOOGLE_THUMB_EDGE: u32 = 720;
+    const YTIMG_THUMB_VARIANT: &str = "sddefault.jpg";
+
     let mut out = url.to_string();
 
     if (out.contains("googleusercontent.com") || out.contains("ggpht.com"))
         && out.rsplit_once('=').is_some()
     {
         if let Some((base, _)) = out.rsplit_once('=') {
-            return format!("{base}=w1200-h1200-l90-rj");
+            return format!("{base}=w{GOOGLE_THUMB_EDGE}-h{GOOGLE_THUMB_EDGE}-l90-rj");
         }
     }
 
     if out.contains("ytimg.com/vi/") {
-        out = out.replace("/default.jpg", "/maxresdefault.jpg");
-        out = out.replace("/mqdefault.jpg", "/maxresdefault.jpg");
-        out = out.replace("/hqdefault.jpg", "/maxresdefault.jpg");
+        out = out.replace("/default.jpg", &format!("/{YTIMG_THUMB_VARIANT}"));
+        out = out.replace("/mqdefault.jpg", &format!("/{YTIMG_THUMB_VARIANT}"));
+        out = out.replace("/hqdefault.jpg", &format!("/{YTIMG_THUMB_VARIANT}"));
     }
 
     out
@@ -2418,20 +2428,20 @@ mod tests {
     }
 
     #[test]
-    fn thumbnail_upgrade_prefers_higher_res_google_images() {
+    fn thumbnail_upgrade_prefers_moderate_google_images() {
         let url = "https://lh3.googleusercontent.com/abc=w120-h120-l90-rj";
         assert_eq!(
             upgrade_thumbnail_url(url),
-            "https://lh3.googleusercontent.com/abc=w1200-h1200-l90-rj"
+            "https://lh3.googleusercontent.com/abc=w720-h720-l90-rj"
         );
     }
 
     #[test]
-    fn thumbnail_upgrade_prefers_maxres_ytimg() {
+    fn thumbnail_upgrade_prefers_moderate_ytimg() {
         let url = "https://i.ytimg.com/vi/xyz/hqdefault.jpg";
         assert_eq!(
             upgrade_thumbnail_url(url),
-            "https://i.ytimg.com/vi/xyz/maxresdefault.jpg"
+            "https://i.ytimg.com/vi/xyz/sddefault.jpg"
         );
     }
 

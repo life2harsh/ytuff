@@ -8,10 +8,12 @@ use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fs;
 use std::io::{self, Write};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-const CELL_PX: u32 = 10;
 const ART_BG: [u8; 3] = [12, 14, 18];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +67,9 @@ pub struct Media {
     sig: String,
     dirty: bool,
     renderer: ArtRenderer,
-    renderer_note: Option<&'static str>,
+    renderer_note: Option<String>,
+    last_cov: Option<Rect>,
+    last_logo: Option<Rect>,
 }
 
 impl Media {
@@ -75,10 +79,9 @@ impl Media {
         let (renderer, renderer_note) = match requested {
             ArtRenderer::Off => (ArtRenderer::Off, None),
             ArtRenderer::Sixel if sixel_ready => (ArtRenderer::Sixel, None),
-            ArtRenderer::Sixel => (ArtRenderer::Blocks, Some("sixel unavailable")),
-            // `wimg` works well as an external previewer, but its inline ANSI output is not
-            // constrained to a Ratatui widget box. Keep panel rendering box-safe.
-            ArtRenderer::Wimg => (ArtRenderer::Blocks, Some("wimg preview only")),
+            ArtRenderer::Sixel => (ArtRenderer::Blocks, Some("sixel unavailable".to_string())),
+            ArtRenderer::Wimg if wimg_on() => (ArtRenderer::Wimg, Some("overlay".to_string())),
+            ArtRenderer::Wimg => (ArtRenderer::Blocks, Some("wimg unavailable".to_string())),
             ArtRenderer::Blocks => (ArtRenderer::Blocks, None),
         };
         Self {
@@ -91,6 +94,8 @@ impl Media {
             dirty: true,
             renderer,
             renderer_note,
+            last_cov: None,
+            last_logo: None,
         }
     }
 
@@ -103,7 +108,7 @@ impl Media {
     }
 
     pub fn renderer_label(&self) -> String {
-        if let Some(note) = self.renderer_note {
+        if let Some(note) = self.renderer_note.as_ref() {
             return format!("{} ({})", self.renderer.label(), note);
         }
         self.renderer.label().to_string()
@@ -144,6 +149,7 @@ impl Media {
         if self.renderer == ArtRenderer::Off {
             return Ok(());
         }
+        let logo = if sc_on { logo } else { None };
         let sig = format!(
             "{}:{:?}:{:?}:{}:{}",
             hide,
@@ -157,6 +163,15 @@ impl Media {
         }
         self.sig = sig;
         self.dirty = false;
+
+        let next_cov = cov.map(|(_, rect)| rect);
+        let next_logo = logo;
+        if let Some(rect) = self.last_cov.filter(|prev| Some(*prev) != next_cov) {
+            self.draw_blank(rect)?;
+        }
+        if let Some(rect) = self.last_logo.filter(|prev| Some(*prev) != next_logo) {
+            self.draw_blank(rect)?;
+        }
 
         if let Some((key, rect)) = cov {
             if hide {
@@ -180,6 +195,9 @@ impl Media {
             }
         }
 
+        self.last_cov = next_cov;
+        self.last_logo = next_logo;
+
         Ok(())
     }
 
@@ -188,7 +206,7 @@ impl Media {
             ArtRenderer::Off => None,
             ArtRenderer::Sixel => self.frame_sixel(key, rect),
             ArtRenderer::Blocks => self.frame_blocks(key, rect),
-            ArtRenderer::Wimg => self.frame_blocks(key, rect),
+            ArtRenderer::Wimg => self.frame_wimg(key, rect),
         }
     }
 
@@ -196,7 +214,8 @@ impl Media {
         match self.renderer {
             ArtRenderer::Off => None,
             ArtRenderer::Sixel => self.frame_logo_sixel(rect),
-            ArtRenderer::Wimg | ArtRenderer::Blocks => self.frame_logo_blocks(rect),
+            ArtRenderer::Wimg => self.frame_logo_wimg(rect),
+            ArtRenderer::Blocks => self.frame_logo_blocks(rect),
         }
     }
 
@@ -204,7 +223,8 @@ impl Media {
         match self.renderer {
             ArtRenderer::Off => Ok(()),
             ArtRenderer::Sixel => self.draw_blank_sixel(rect),
-            ArtRenderer::Wimg | ArtRenderer::Blocks => self.draw_blank_blocks(rect),
+            ArtRenderer::Wimg => self.draw_blank_sixel(rect),
+            ArtRenderer::Blocks => self.draw_blank_blocks(rect),
         }
     }
 
@@ -243,6 +263,18 @@ impl Media {
         Some(buf)
     }
 
+    fn frame_wimg(&mut self, key: &str, rect: Rect) -> Option<Vec<u8>> {
+        let ck = format!("wimg:cov:{key}:{}x{}", rect.width, rect.height);
+        if let Some(buf) = self.enc.get(&ck) {
+            return Some(buf.clone());
+        }
+        let dat = self.raw.get(key)?;
+        let img = image::load_from_memory(dat).ok()?;
+        let buf = enc_wimg(img, rect).ok()?;
+        self.enc.insert(ck, buf.clone());
+        Some(buf)
+    }
+
     fn frame_logo_blocks(&mut self, rect: Rect) -> Option<Vec<u8>> {
         let ck = format!("blocks:logo:{}x{}", rect.width, rect.height);
         if let Some(buf) = self.enc.get(&ck) {
@@ -254,14 +286,25 @@ impl Media {
         Some(buf)
     }
 
+    fn frame_logo_wimg(&mut self, rect: Rect) -> Option<Vec<u8>> {
+        let ck = format!("wimg:logo:{}x{}", rect.width, rect.height);
+        if let Some(buf) = self.enc.get(&ck) {
+            return Some(buf.clone());
+        }
+        let img = image::load_from_memory(&self.logo).ok()?;
+        let buf = enc_wimg(img, rect).ok()?;
+        self.enc.insert(ck, buf.clone());
+        Some(buf)
+    }
+
     fn draw_blank_sixel(&self, rect: Rect) -> Result<()> {
         if rect.width < 1 || rect.height < 1 {
             return Ok(());
         }
         let (w, h) = canvas_dimensions(rect);
         let img = RgbImage::from_pixel(w.max(1), h.max(1), Rgb(ART_BG));
-        let six = enc_six(img.as_raw(), w as usize, h as usize, 64);
-        self.out(rect, six.as_bytes())
+        let six = wrap_sixel(enc_six(img.as_raw(), w as usize, h as usize, 64));
+        self.out_graphic(rect, &six)
     }
 
     fn draw_blank_blocks(&self, rect: Rect) -> Result<()> {
@@ -269,14 +312,18 @@ impl Media {
             return Ok(());
         }
         let buf = enc_blank_blocks(rect);
-        self.out(rect, &buf)
+        self.out_blocks(rect, &buf)
     }
 
     fn draw_frame(&self, rect: Rect, buf: &[u8]) -> Result<()> {
-        self.out(rect, buf)
+        match self.renderer {
+            ArtRenderer::Off => Ok(()),
+            ArtRenderer::Blocks => self.out_blocks(rect, buf),
+            ArtRenderer::Sixel | ArtRenderer::Wimg => self.out_graphic(rect, buf),
+        }
     }
 
-    fn out(&self, rect: Rect, buf: &[u8]) -> Result<()> {
+    fn out_blocks(&self, rect: Rect, buf: &[u8]) -> Result<()> {
         let mut out = io::stdout();
         queue!(out, SavePosition)?;
         let base_x = rect.x + 1;
@@ -294,17 +341,30 @@ impl Media {
         out.flush()?;
         Ok(())
     }
+
+    fn out_graphic(&self, rect: Rect, buf: &[u8]) -> Result<()> {
+        if rect.width < 1 || rect.height < 1 {
+            return Ok(());
+        }
+        let mut out = io::stdout();
+        queue!(out, SavePosition)?;
+        out.write_all(&format!("\x1b[{};{}H", rect.y + 1, rect.x + 1).into_bytes())?;
+        out.write_all(buf)?;
+        queue!(out, RestorePosition)?;
+        out.flush()?;
+        Ok(())
+    }
 }
 
 fn enc_img(img: DynamicImage, rect: Rect) -> Result<Vec<u8>> {
     let rgb = fit_to_canvas(img, rect);
     let (w, h) = rgb.dimensions();
-    let six = enc_six(rgb.as_raw(), w as usize, h as usize, 256);
-    let mut out = Vec::with_capacity(six.len() + 8);
-    out.extend_from_slice(b"\x1bPq");
-    out.extend_from_slice(six.as_bytes());
-    out.extend_from_slice(b"\x1b\\");
-    Ok(out)
+    Ok(wrap_sixel(enc_six(
+        rgb.as_raw(),
+        w as usize,
+        h as usize,
+        256,
+    )))
 }
 
 fn enc_blocks(img: DynamicImage, rect: Rect) -> Vec<u8> {
@@ -344,6 +404,33 @@ fn enc_blocks(img: DynamicImage, rect: Rect) -> Vec<u8> {
     }
 
     out.into_bytes()
+}
+
+fn enc_wimg(img: DynamicImage, rect: Rect) -> Result<Vec<u8>> {
+    let rgb = fit_to_canvas(img, rect);
+    let path = temp_wimg_path();
+    image::DynamicImage::ImageRgb8(rgb).save(&path)?;
+
+    let output = Command::new("wimg")
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    let _ = fs::remove_file(&path);
+
+    if !output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if msg.is_empty() {
+            anyhow::bail!("wimg exited with status {}", output.status);
+        }
+        anyhow::bail!("wimg failed: {}", msg);
+    }
+
+    if output.stdout.is_empty() {
+        anyhow::bail!("wimg returned no image bytes");
+    }
+
+    Ok(normalize_graphic(output.stdout))
 }
 
 fn enc_blank_blocks(rect: Rect) -> Vec<u8> {
@@ -414,19 +501,17 @@ fn fit(img: DynamicImage, max_w: u32, max_h: u32) -> DynamicImage {
 }
 
 fn canvas_dimensions(rect: Rect) -> (u32, u32) {
+    let (cell_w, cell_h) = art_cell_pixels();
     (
-        (rect.width.max(1) as u32) * CELL_PX,
-        (rect.height.max(1) as u32) * CELL_PX,
+        (rect.width.max(1) as u32) * cell_w,
+        (rect.height.max(1) as u32) * cell_h,
     )
 }
 
 fn cell_dimensions(rect: Rect) -> (u32, u32) {
     // Render each terminal cell as a 2x2 color quadrant to keep the fallback
     // path smooth and broadly compatible across terminal fonts.
-    (
-        rect.width.max(1) as u32 * 2,
-        rect.height.max(1) as u32 * 2,
-    )
+    (rect.width.max(1) as u32 * 2, rect.height.max(1) as u32 * 2)
 }
 
 fn pixel_or_bg(rgb: &RgbImage, x: u32, y: u32) -> [u8; 3] {
@@ -638,3 +723,56 @@ fn sixel_on() -> bool {
     false
 }
 
+fn art_cell_pixels() -> (u32, u32) {
+    let (default_w, default_h) = if cfg!(windows) { (8, 16) } else { (10, 20) };
+    let w = env_u32("RUSTPLAYER_ART_CELL_W").unwrap_or(default_w).max(1);
+    let h = env_u32("RUSTPLAYER_ART_CELL_H").unwrap_or(default_h).max(1);
+    (w, h)
+}
+
+fn env_u32(name: &str) -> Option<u32> {
+    env::var(name).ok()?.trim().parse().ok()
+}
+
+fn wrap_sixel(six: String) -> Vec<u8> {
+    let mut out = Vec::with_capacity(six.len() + 8);
+    out.extend_from_slice(b"\x1bPq");
+    out.extend_from_slice(six.as_bytes());
+    out.extend_from_slice(b"\x1b\\");
+    out
+}
+
+fn normalize_graphic(buf: Vec<u8>) -> Vec<u8> {
+    if buf.starts_with(b"\x1bP") {
+        return buf;
+    }
+    if buf.starts_with(b"\"") || buf.starts_with(b"#") {
+        let mut out = Vec::with_capacity(buf.len() + 8);
+        out.extend_from_slice(b"\x1bPq");
+        out.extend_from_slice(&buf);
+        out.extend_from_slice(b"\x1b\\");
+        return out;
+    }
+    buf
+}
+
+fn wimg_on() -> bool {
+    Command::new("wimg")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn temp_wimg_path() -> std::path::PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "rustplayer-wimg-{}-{stamp}.png",
+        std::process::id()
+    ));
+    path
+}
