@@ -1,0 +1,56 @@
+; NSIS installer script for RustPlayer (Windows)
+; Requires NSIS: https://nsis.sourceforge.io/
+
+OutFile "rustplayer-setup.exe"
+InstallDir "$PROGRAMFILES64\RustPlayer"
+RequestExecutionLevel admin
+
+!include "MUI2.nsh"
+
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+
+!insertmacro MUI_LANGUAGE "English"
+
+Section "RustPlayer" SecMain
+    SetOutPath "$INSTDIR"
+    
+    File "target\release\rustplayer.exe"
+    File "README.md"
+    File "LICENSE"
+    
+    ; Create uninstaller
+    WriteUninstaller "$INSTDIR\uninstall.exe"
+    
+    ; Create Start Menu shortcut
+    CreateDirectory "$SMPROGRAMS\RustPlayer"
+    CreateShortcut "$SMPROGRAMS\RustPlayer\RustPlayer.lnk" "$INSTDIR\rustplayer.exe"
+    CreateShortcut "$SMPROGRAMS\RustPlayer\Uninstall.lnk" "$INSTDIR\uninstall.exe"
+    
+    ; Add to Add/Remove Programs
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RustPlayer" \
+                     "DisplayName" "RustPlayer"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RustPlayer" \
+                     "UninstallString" "$INSTDIR\uninstall.exe"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RustPlayer" \
+                     "InstallLocation" "$INSTDIR"
+SectionEnd
+
+Section "Uninstall"
+    Delete "$INSTDIR\rustplayer.exe"
+    Delete "$INSTDIR\README.md"
+    Delete "$INSTDIR\LICENSE"
+    Delete "$INSTDIR\uninstall.exe"
+    RMDir "$INSTDIR"
+    
+    Delete "$SMPROGRAMS\RustPlayer\RustPlayer.lnk"
+    Delete "$SMPROGRAMS\RustPlayer\Uninstall.lnk"
+    RMDir "$SMPROGRAMS\RustPlayer"
+    
+    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RustPlayer"
+SectionEnd

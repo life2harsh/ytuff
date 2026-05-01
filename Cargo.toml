@@ -2,6 +2,15 @@
 name = "rustplayer"
 version = "0.1.0"
 edition = "2021"
+description = "A fast and lightweight music player built with Rust"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/yourusername/rustplayer"
+repository = "https://github.com/yourusername/rustplayer"
+keywords = ["music", "player", "audio", "rust", "terminal"]
+categories = ["multimedia::audio"]
+autoexamples = false
 
 [dependencies]
 walkdir = "2"
