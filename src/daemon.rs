@@ -32,6 +32,7 @@ pub enum RpcRequest {
     ClearQueue,
     SetAutoplay { enabled: bool },
     SetSleep { minutes: Option<u64> },
+    Lyrics { cached: bool },
     Shutdown,
 }
 
@@ -40,6 +41,7 @@ pub struct RpcResponse {
     pub ok: bool,
     pub message: String,
     pub status: Option<PlayerStatus>,
+    pub lyrics: Option<LyricsDoc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -173,19 +175,25 @@ fn handle_client(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<bool
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     let request = serde_json::from_str::<RpcRequest>(&line)?;
 
-    let keep_running = !matches!(request, RpcRequest::Shutdown);
-    let response = match apply_request(request, state) {
+    let keep_running = !matches!(&request, RpcRequest::Shutdown);
+    let mut response = match apply_request(request.clone(), state) {
         Ok(message) => RpcResponse {
             ok: true,
             message,
             status: Some(status_snapshot(state)),
+            lyrics: None,
         },
         Err(err) => RpcResponse {
             ok: false,
             message: err.to_string(),
             status: Some(status_snapshot(state)),
+            lyrics: None,
         },
     };
+
+    if let RpcRequest::Lyrics { .. } = &request {
+        response.lyrics = apply_lyrics_request(&request, state).ok().flatten();
+    }
 
     stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
     stream.write_all(b"\n")?;
@@ -282,6 +290,13 @@ fn apply_request(request: RpcRequest, state: &Arc<SharedState>) -> Result<String
                 None => "sleep timer cleared".to_string(),
             })
         }
+        RpcRequest::Lyrics { cached } => {
+            if apply_lyrics_request(&RpcRequest::Lyrics { cached }, state)?.is_some() {
+                Ok("lyrics".to_string())
+            } else {
+                Err(anyhow!("No lyrics found for the current track"))
+            }
+        }
         RpcRequest::Shutdown => {
             state.shutdown.store(true, Ordering::Relaxed);
             state.pb_tx.send(PlaybackCommand::Quit)?;
@@ -361,4 +376,32 @@ fn make_client(cfg: &AppConfig) -> Result<SoundCloudClient> {
     client.set_cookie_header(cfg.cookie_header()?);
     client.set_auth_user(cfg.youtube_auth_user.clone());
     Ok(client)
+}
+
+fn apply_lyrics_request(
+    request: &RpcRequest,
+    state: &Arc<SharedState>,
+) -> Result<Option<LyricsDoc>> {
+    let RpcRequest::Lyrics { cached } = request else {
+        return Ok(None);
+    };
+    let track = state
+        .core
+        .cur_id()
+        .and_then(|id| state.core.track(&id))
+        .ok_or_else(|| anyhow!("No track is currently playing"))?;
+    if *cached {
+        if let Some(doc) = state.current_lyrics.lock().unwrap().clone() {
+            return Ok(Some(doc));
+        }
+        return state.lyrics.cached_track(&track);
+    }
+
+    if let Some(doc) = state.current_lyrics.lock().unwrap().clone() {
+        return Ok(Some(doc));
+    }
+
+    let doc = state.lyrics.lookup_track(&track)?;
+    *state.current_lyrics.lock().unwrap() = doc.clone();
+    Ok(doc)
 }

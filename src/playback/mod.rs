@@ -1,5 +1,6 @@
 use crate::core::track::Track;
 use crate::core::Core;
+use crate::media_controls::MediaSession;
 use crate::sources::soundcloud::SoundCloudClient;
 use rand::seq::SliceRandom;
 use rodio::buffer::SamplesBuffer;
@@ -44,14 +45,17 @@ pub enum PlaybackCommand {
     Pause,
     Resume,
     Stop,
+    TogglePause,
     Next,
     Prev,
     Quit,
     VolumeUp,
     VolumeDown,
     ToggleMute,
+    SetVolume(f32),
     SkipForward(u64),
     SkipBackward(u64),
+    SeekTo(u64),
     ToggleVisualizer,
     ToggleAutoplay,
     ToggleRepeat,
@@ -1164,6 +1168,15 @@ pub fn start_audio_thread(
 
         let fft_processor = Arc::new(Mutex::new(FftProcessor::new(2048)));
         let visualizer_enabled = Arc::new(Mutex::new(false));
+        let mut media_session = match MediaSession::new(tx_clone.clone()) {
+            Ok(session) => session,
+            Err(err) => {
+                msg_tx
+                    .send(format!("media controls unavailable: {}", err))
+                    .ok();
+                None
+            }
+        };
 
         autoplay_tx.send(autoplay).ok();
         repeat_tx.send(repeat_mode).ok();
@@ -1199,6 +1212,10 @@ pub fn start_audio_thread(
                 elapsed_before_pause = current_duration;
             }
             *position_clone.lock().unwrap() = Some((current_pos, current_duration, is_playing));
+            if let Some(session) = media_session.as_mut() {
+                let track = current_track_id.as_ref().and_then(|id| core.track(id));
+                session.sync(track.as_ref(), current_pos, is_playing, volume);
+            }
 
             if last_device_check.elapsed() >= Duration::from_millis(750) {
                 last_device_check = Instant::now();
@@ -1572,6 +1589,19 @@ pub fn start_audio_thread(
                             }
                         }
                     }
+                    PlaybackCommand::TogglePause => {
+                        if let Some(ref s) = sink {
+                            if is_paused {
+                                is_paused = false;
+                                playback_start = Some(Instant::now());
+                                s.play();
+                            } else {
+                                elapsed_before_pause = current_pos;
+                                is_paused = true;
+                                s.pause();
+                            }
+                        }
+                    }
                     PlaybackCommand::Stop => {
                         sink = None;
                         current_track_id = None;
@@ -1610,6 +1640,13 @@ pub fn start_audio_thread(
                             }
                         }
                     }
+                    PlaybackCommand::SetVolume(next_volume) => {
+                        volume = next_volume.clamp(0.0, 1.0);
+                        if let Some(ref s) = sink {
+                            s.set_volume(volume);
+                        }
+                        volume_tx.send(volume).ok();
+                    }
                     PlaybackCommand::SkipForward(secs) => {
                         let new_pos = (current_pos + secs).min(current_duration);
                         if let Some(ref s) = sink {
@@ -1619,6 +1656,18 @@ pub fn start_audio_thread(
                                     playback_start = Some(Instant::now());
                                 }
                                 Err(e) => eprintln!("Seek forward failed: {:?}", e),
+                            }
+                        }
+                    }
+                    PlaybackCommand::SeekTo(target) => {
+                        let new_pos = target.min(current_duration);
+                        if let Some(ref s) = sink {
+                            match s.try_seek(Duration::from_secs(new_pos)) {
+                                Ok(_) => {
+                                    elapsed_before_pause = new_pos;
+                                    playback_start = Some(Instant::now());
+                                }
+                                Err(e) => eprintln!("Seek failed: {:?}", e),
                             }
                         }
                     }

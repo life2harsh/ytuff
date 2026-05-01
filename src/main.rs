@@ -4,6 +4,7 @@ mod core;
 mod daemon;
 mod downloads;
 mod lyrics;
+mod media_controls;
 mod playback;
 mod playlist;
 mod resolve;
@@ -78,6 +79,8 @@ enum Command {
         input: Option<String>,
         #[arg(long)]
         cached: bool,
+        #[arg(long)]
+        json: bool,
     },
     Download {
         input: String,
@@ -219,9 +222,11 @@ fn main() -> Result<()> {
         Some(Command::Prev) => simple_request(&runtime, &RpcRequest::Prev, "returned"),
         Some(Command::Queue { command }) => queue_command(&runtime, command, cli.json),
         Some(Command::Playlist { command }) => playlist_command(&runtime, command, cli.json),
-        Some(Command::Lyrics { input, cached }) => {
-            lyrics_command(&runtime, input.as_deref(), *cached)
-        }
+        Some(Command::Lyrics {
+            input,
+            cached,
+            json,
+        }) => lyrics_command(&runtime, input.as_deref(), *cached, *json),
         Some(Command::Download {
             input,
             format,
@@ -647,7 +652,16 @@ fn playlist_command(runtime: &Runtime, command: &PlaylistCommand, json: bool) ->
     }
 }
 
-fn lyrics_command(runtime: &Runtime, input: Option<&str>, cached: bool) -> Result<()> {
+fn lyrics_command(runtime: &Runtime, input: Option<&str>, cached: bool, json: bool) -> Result<()> {
+    if input.is_none() {
+        if let Ok(response) = send_request(&runtime.cfg.daemon_addr, &RpcRequest::Lyrics { cached })
+        {
+            if let Some(doc) = response.lyrics {
+                return print_json_or_text(&doc, json, || render_lyrics(&doc));
+            }
+        }
+    }
+
     let lyrics = LyricsClient::new(runtime.paths.clone());
     let track = match input {
         Some(input) => runtime.resolve_track(input)?,
@@ -660,22 +674,7 @@ fn lyrics_command(runtime: &Runtime, input: Option<&str>, cached: bool) -> Resul
     }
     .ok_or_else(|| anyhow!("No lyrics found for '{}'", track.title))?;
 
-    if doc.instrumental {
-        println!("instrumental");
-        return Ok(());
-    }
-
-    if let Some(synced) = doc.synced.as_deref() {
-        println!("{synced}");
-        return Ok(());
-    }
-
-    if let Some(plain) = doc.plain.as_deref() {
-        println!("{plain}");
-        return Ok(());
-    }
-
-    Err(anyhow!("Lyrics provider returned an empty document"))
+    print_json_or_text(&doc, json, || render_lyrics(&doc))
 }
 
 fn download_input(
@@ -1127,6 +1126,22 @@ fn format_track_line(track: &Track) -> String {
         track.title,
         track.who()
     )
+}
+
+fn render_lyrics(doc: &crate::lyrics::LyricsDoc) -> String {
+    if doc.instrumental {
+        return "instrumental".to_string();
+    }
+
+    if let Some(synced) = doc.synced.as_deref() {
+        return synced.to_string();
+    }
+
+    if let Some(plain) = doc.plain.as_deref() {
+        return plain.to_string();
+    }
+
+    "lyrics unavailable".to_string()
 }
 
 #[cfg(test)]

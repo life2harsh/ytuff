@@ -41,6 +41,7 @@ RustPlayer can render artwork inline in the artwork panel. Choose a renderer wit
 ```bash
 RUSTPLAYER_ART=blocks   # ANSI blocks (default)
 RUSTPLAYER_ART=sixel    # Sixel-capable terminals
+RUSTPLAYER_ART=1        # Shorthand for wimg
 RUSTPLAYER_ART=wimg     # Uses wimg as a cached inline overlay
 RUSTPLAYER_ART=off       # Disable inline artwork
 ```

@@ -3,6 +3,7 @@ use crate::auth::{youtube_login_window, AuthSession};
 use crate::core::track::{Acc, Track};
 use crate::core::Core;
 use crate::downloads::{download_track, DownloadFormat};
+use crate::lyrics::{LyricsClient, LyricsDoc};
 use crate::playback::{CollectionKind, PlaybackCommand, PlaybackHandle, RepeatMode};
 use crate::sources::soundcloud::{build_auth_link, Ql, ScState, SoundCloudClient};
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind};
@@ -24,6 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const REMOTE_PREFETCH_DEBOUNCE_MS: u64 = 75;
+
 pub enum ScReq {
     Init,
     Home,
@@ -35,6 +38,7 @@ pub enum ScReq {
     Login,
     Logout,
     Art(String, String),
+    Lyrics(Track),
     DownloadTracks(Vec<Track>),
     DownloadCollection(String, String),
 }
@@ -50,6 +54,7 @@ enum ScEvt {
     ),
     Suggest(String, Result<Vec<String>, String>),
     Art(String, Result<Vec<u8>, String>),
+    Lyrics(String, Result<Option<LyricsDoc>, String>),
     Notice(String),
 }
 
@@ -102,6 +107,7 @@ pub struct App {
     show_help: bool,
     show_dev: bool,
     show_fld: bool,
+    show_lyrics: bool,
     show_viz: bool,
     inp: bool,
     qry: String,
@@ -130,6 +136,10 @@ pub struct App {
     logo_box: Option<Rect>,
     art_key: Option<String>,
     prefetch_due: Option<(String, Instant)>,
+    lyrics_track_id: Option<String>,
+    lyrics_doc: Option<LyricsDoc>,
+    lyrics_loading: bool,
+    lyrics_ready: bool,
 }
 
 impl App {
@@ -165,6 +175,7 @@ impl App {
             show_help: false,
             show_dev: false,
             show_fld: false,
+            show_lyrics: false,
             show_viz: false,
             inp: false,
             qry: String::new(),
@@ -193,6 +204,10 @@ impl App {
             logo_box: None,
             art_key: None,
             prefetch_due: None,
+            lyrics_track_id: None,
+            lyrics_doc: None,
+            lyrics_loading: false,
+            lyrics_ready: false,
         }
     }
 
@@ -578,6 +593,7 @@ impl App {
         };
         self.inp = false;
         self.show_fld = false;
+        self.show_lyrics = false;
         self.lres_on = false;
         self.qry.clear();
         self.clear_suggestions();
@@ -652,7 +668,7 @@ impl App {
     }
 
     fn overlay_active(&self) -> bool {
-        self.show_help || self.show_dev || self.show_fld || self.inp
+        self.show_help || self.show_dev || self.show_fld || self.show_lyrics || self.inp
     }
 
     fn sync_art(&mut self) {
@@ -665,7 +681,7 @@ impl App {
                 (track.is_playable_remote() && track.acc != Some(Acc::Block)).then(|| {
                     (
                         track.id.clone(),
-                        Instant::now() + Duration::from_millis(180),
+                        Instant::now() + Duration::from_millis(REMOTE_PREFETCH_DEBOUNCE_MS),
                     )
                 })
             });
@@ -688,6 +704,24 @@ impl App {
         let _ = self.pb.tx.send(PlaybackCommand::PrefetchTrack(track_id));
     }
 
+    fn sync_lyrics(&mut self) {
+        let current = self.cur_track();
+        let next_id = current.as_ref().map(|track| track.id.clone());
+        if next_id == self.lyrics_track_id {
+            return;
+        }
+
+        self.lyrics_track_id = next_id;
+        self.lyrics_doc = None;
+        self.lyrics_loading = false;
+        self.lyrics_ready = false;
+
+        if let Some(track) = current {
+            self.lyrics_loading = true;
+            let _ = self.sc.tx.send(ScReq::Lyrics(track));
+        }
+    }
+
     fn preview_art(&mut self) -> anyhow::Result<()> {
         let Some(key) = self.art_key.as_deref() else {
             anyhow::bail!("No artwork is selected yet");
@@ -704,11 +738,18 @@ impl App {
             .iter()
             .map(|track| track.id.clone())
             .collect::<Vec<_>>();
+        let first_prefetch = tracks
+            .first()
+            .filter(|track| track.is_playable_remote() && track.acc != Some(Acc::Block))
+            .map(|track| track.id.clone());
         self.core.put_tracks(tracks);
         self.sc_title = title.into();
         self.sc_ids = ids;
         self.sc_st.select(Some(0));
         self.img.mark();
+        if let Some(track_id) = first_prefetch {
+            let _ = self.pb.tx.send(PlaybackCommand::PrefetchTrack(track_id));
+        }
     }
 
     fn current_collection_kind(&self) -> Option<CollectionKind> {
@@ -932,6 +973,13 @@ pub fn run_ui(
                 ScEvt::Art(key, dat) => {
                     app.img.put(key, dat);
                 }
+                ScEvt::Lyrics(track_id, res) => {
+                    if app.lyrics_track_id.as_deref() == Some(track_id.as_str()) {
+                        app.lyrics_loading = false;
+                        app.lyrics_ready = true;
+                        app.lyrics_doc = res.ok().flatten();
+                    }
+                }
                 ScEvt::Notice(msg) => {
                     app.sc_busy = false;
                     app.note(msg);
@@ -942,6 +990,7 @@ pub fn run_ui(
         app.poll_suggestions();
         app.poll_prefetch();
         app.sync_art();
+        app.sync_lyrics();
         let overlay_active = app.overlay_active();
         if overlay_active != overlay_was_active {
             term.clear()?;
@@ -1039,6 +1088,21 @@ pub fn run_ui(
                                 app.show_fld = false;
                                 app.inp = true;
                                 app.img.mark();
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    if app.show_lyrics {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('y') => {
+                                app.show_lyrics = false;
+                                app.img.mark();
+                            }
+                            KeyCode::Char('q') => {
+                                let _ = app.pb.tx.send(PlaybackCommand::Quit);
+                                break;
                             }
                             _ => {}
                         }
@@ -1156,6 +1220,10 @@ pub fn run_ui(
                                 Ok(()) => app.note("art preview closed"),
                                 Err(err) => app.note(err.to_string()),
                             }
+                            app.img.mark();
+                        }
+                        KeyCode::Char('y') => {
+                            app.show_lyrics = !app.show_lyrics;
                             app.img.mark();
                         }
                         KeyCode::Char('D') => app.download_selected(),
@@ -1314,6 +1382,7 @@ fn start_sc(
     let (tx, rx) = mpsc::channel::<ScReq>();
     let (etx, erx) = mpsc::channel::<ScEvt>();
     thread::spawn(move || {
+        let lyrics = LyricsClient::new(paths.clone());
         while let Ok(cmd) = rx.recv() {
             match cmd {
                 ScReq::Init => {
@@ -1478,6 +1547,10 @@ fn start_sc(
                     let dat = sc.lock().unwrap().art(&url).map_err(|e| e.to_string());
                     let _ = etx.send(ScEvt::Art(key, dat));
                 }
+                ScReq::Lyrics(track) => {
+                    let res = lyrics.lookup_track(&track).map_err(|err| err.to_string());
+                    let _ = etx.send(ScEvt::Lyrics(track.id.clone(), res));
+                }
                 ScReq::DownloadTracks(tracks) => {
                     let cfg_snapshot = cfg.lock().unwrap().clone();
                     let out_dir = cfg_snapshot.effective_downloads_dir(&paths);
@@ -1593,7 +1666,7 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     }
     draw_foot(f, app, root[2]);
 
-    if app.show_help || app.show_dev || app.show_fld {
+    if app.show_help || app.show_dev || app.show_fld || app.show_lyrics {
         draw_overlay_backdrop(f, size);
     }
     if app.show_help {
@@ -1604,6 +1677,9 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     }
     if app.show_fld {
         draw_fld(f, app, size);
+    }
+    if app.show_lyrics {
+        draw_lyrics(f, app, size);
     }
     if app.inp {
         draw_inp(f, app, size);
@@ -1814,7 +1890,7 @@ fn draw_art_box(f: &mut Frame, app: &mut App, area: Rect) {
             &[
                 "Artwork disabled",
                 "set RUSTPLAYER_ART=blocks",
-                "or set RUSTPLAYER_ART=sixel/wimg",
+                "or set RUSTPLAYER_ART=1/wimg/sixel",
             ],
             Alignment::Left,
         );
@@ -2189,6 +2265,8 @@ fn draw_foot(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(" open  "),
         hot("i"),
         Span::raw(" art preview  "),
+        hot("y"),
+        Span::raw(" lyrics  "),
         hot("D"),
         Span::raw(" download  "),
         hot("q"),
@@ -2224,6 +2302,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("left/right seek 5s, b/f seek 30s"),
         Line::from("o open selected youtube link"),
         Line::from("i preview selected artwork, or now playing art, with wimg"),
+        Line::from("y open lyrics for the current track"),
         Line::from("D download selected track, or selected playlist/album as m4a"),
         Line::from("right artwork = now playing"),
         Line::from("g load youtube home, m load account playlists, u go back"),
@@ -2243,6 +2322,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("or : rustplayer auth cookie-header \"SID=...; SAPISID=...\""),
         Line::from("or : rustplayer auth headers-file <headers.json>"),
         Line::from("or : rustplayer auth login"),
+        Line::from("lyrics  : rustplayer lyrics [--cached] [--json]"),
         Line::from("download: rustplayer download <url> --format m4a|mp3"),
         Line::from("control : rustplayer status | play | pause | next"),
         Line::from("q or esc closes overlays, q quits app"),
@@ -2256,6 +2336,54 @@ fn draw_help(f: &mut Frame, area: Rect) {
                 .border_style(Style::default().fg(Color::Rgb(117, 214, 255))),
         )
         .wrap(Wrap { trim: true });
+    f.render_widget(Clear, box_a);
+    f.render_widget(p, box_a);
+}
+
+fn draw_lyrics(f: &mut Frame, app: &App, area: Rect) {
+    let box_a = centered(area, 74, 82);
+    let title = app
+        .cur_track()
+        .map(|track| {
+            format!(
+                " Lyrics | {} - {} ",
+                trim(&track.title, 24),
+                trim(&track.who(), 20)
+            )
+        })
+        .unwrap_or_else(|| " Lyrics ".to_string());
+
+    let body = if let Some(track) = app.cur_track() {
+        if app.lyrics_loading && !app.lyrics_ready {
+            format!("Loading lyrics for {}\n", track.title)
+        } else if let Some(doc) = app.lyrics_doc.as_ref() {
+            if doc.instrumental {
+                "instrumental".to_string()
+            } else if let Some(synced) = doc.synced.as_deref() {
+                synced.to_string()
+            } else if let Some(plain) = doc.plain.as_deref() {
+                plain.to_string()
+            } else {
+                "lyrics unavailable".to_string()
+            }
+        } else if app.lyrics_ready {
+            format!("No lyrics found for {}\n", track.title)
+        } else {
+            format!("Loading lyrics for {}\n", track.title)
+        }
+    } else {
+        "Nothing is playing right now.".to_string()
+    };
+
+    let p = Paragraph::new(body)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .style(Style::default().bg(Color::Rgb(24, 31, 39)))
+                .border_style(Style::default().fg(Color::Rgb(117, 214, 255))),
+        )
+        .wrap(Wrap { trim: false });
     f.render_widget(Clear, box_a);
     f.render_widget(p, box_a);
 }

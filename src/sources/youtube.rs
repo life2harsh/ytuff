@@ -24,6 +24,8 @@ const WEB_REMIX_CLIENT_VERSION: &str = "1.20260213.01.00";
 const SEARCH_SONGS_FILTER: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
 const VISITOR_PREFIXES: [&str; 2] = ["Cgt", "Cgs"];
 const STREAM_DOWNLOAD_CHUNK_BYTES: u64 = 1024 * 1024 * 2;
+const AUDIO_CACHE_LIMIT: usize = 8;
+const YT_DLP_TIMEOUT_SECS: u64 = 8;
 const HOME_BROWSE_ID: &str = "FEmusic_home";
 const LIBRARY_PLAYLISTS_BROWSE_ID: &str = "FEmusic_liked_playlists";
 
@@ -80,6 +82,7 @@ pub struct YouTubeClient {
     visitor_data: Option<String>,
     stream_cache: HashMap<String, CachedStream>,
     audio_cache: HashMap<String, Vec<u8>>,
+    audio_cache_order: Vec<String>,
     cookie_header: Option<String>,
     auth_user: Option<String>,
     ql: Ql,
@@ -428,6 +431,7 @@ impl YouTubeClient {
             visitor_data: None,
             stream_cache: HashMap::new(),
             audio_cache: HashMap::new(),
+            audio_cache_order: Vec::new(),
             cookie_header: None,
             auth_user: None,
             ql,
@@ -493,6 +497,7 @@ impl YouTubeClient {
         self.visitor_data = None;
         self.stream_cache.clear();
         self.audio_cache.clear();
+        self.audio_cache_order.clear();
         self.cookie_header = None;
         self.auth_user = None;
         Ok(self.state())
@@ -655,12 +660,11 @@ impl YouTubeClient {
             .unwrap_or(tr.id.as_str());
 
         match self
-            .resolve_stream_with_ytdlp(video_id)
-            .or_else(|yt_dlp_err| {
-                self.resolve_stream_with_legacy_pipeline(video_id)
-                    .context(format!(
-                        "yt-dlp stream resolution failed first: {yt_dlp_err:#}"
-                    ))
+            .resolve_stream_with_legacy_pipeline(video_id)
+            .or_else(|legacy_err| {
+                self.resolve_stream_with_ytdlp(video_id).context(format!(
+                    "legacy stream resolution failed first: {legacy_err:#}"
+                ))
             }) {
             Ok(cached) => {
                 self.stream_cache.insert(tr.id.clone(), cached.clone());
@@ -673,19 +677,24 @@ impl YouTubeClient {
     pub fn invalidate_stream(&mut self, track_id: &str) {
         self.stream_cache.remove(track_id);
         self.audio_cache.remove(track_id);
+        self.audio_cache_order.retain(|id| id != track_id);
     }
 
     pub fn take_cached_audio(&mut self, track_id: &str) -> Option<Vec<u8>> {
+        self.audio_cache_order.retain(|id| id != track_id);
         self.audio_cache.remove(track_id)
     }
 
     pub fn store_cached_audio(&mut self, track_id: &str, bytes: Vec<u8>) {
-        if !self.audio_cache.contains_key(track_id) && self.audio_cache.len() >= 4 {
-            if let Some(oldest_key) = self.audio_cache.keys().next().cloned() {
+        self.audio_cache_order.retain(|id| id != track_id);
+        if !self.audio_cache.contains_key(track_id) && self.audio_cache.len() >= AUDIO_CACHE_LIMIT {
+            if let Some(oldest_key) = self.audio_cache_order.first().cloned() {
                 self.audio_cache.remove(&oldest_key);
+                self.audio_cache_order.remove(0);
             }
         }
         self.audio_cache.insert(track_id.to_string(), bytes);
+        self.audio_cache_order.push(track_id.to_string());
     }
 
     pub fn prefetch_track(&mut self, tr: &Track) -> Result<()> {
@@ -870,13 +879,11 @@ impl YouTubeClient {
 
         common_args.push(watch_url.to_string());
 
-        let output = Command::new("python")
-            .args(&common_args)
-            .output()
+        let output = run_ytdlp_command("python", &common_args)
             .or_else(|_| {
                 let mut py_args = vec!["-3".to_string()];
                 py_args.extend(common_args.clone());
-                Command::new("py").args(py_args).output()
+                run_ytdlp_command("py", &py_args)
             })
             .context(
                 "Could not start yt-dlp. Install it with `python -m pip install --user yt-dlp`.",
@@ -1305,6 +1312,32 @@ impl YouTubeClient {
     }
 }
 
+fn run_ytdlp_command(program: &str, args: &[String]) -> Result<std::process::Output> {
+    let mut child = Command::new(program).args(args).spawn()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(YT_DLP_TIMEOUT_SECS);
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return child.wait_with_output().map_err(|err| {
+                anyhow!(format!(
+                    "Could not read yt-dlp output after {status}: {err}"
+                ))
+            });
+        }
+
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!(format!(
+                "yt-dlp timed out after {} seconds",
+                YT_DLP_TIMEOUT_SECS
+            )));
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn parse_search_results(rsp: &Value, lim: usize) -> Vec<Track> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -1477,19 +1510,18 @@ fn parse_library_playlists(rsp: &Value, lim: usize) -> Vec<Track> {
 fn parse_collection_tracks(rsp: &Value, lim: usize) -> Vec<Track> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
+    let collection_art = browse_page_art(rsp);
 
-    if let Some(contents) = rsp
-        .pointer("/contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/contents/0/musicPlaylistShelfRenderer/contents")
-        .and_then(Value::as_array)
-    {
+    if let Some(contents) = collection_track_contents(rsp) {
         for item in contents {
             if let Some(renderer) = item.get("musicResponsiveListItemRenderer") {
-                push_unique_track(
-                    &mut out,
-                    &mut seen,
-                    track_from_responsive_list_renderer(renderer),
-                    lim,
-                );
+                let mut track = track_from_responsive_list_renderer(renderer);
+                if let Some(track) = track.as_mut() {
+                    if track.art.is_none() {
+                        track.art = collection_art.clone();
+                    }
+                }
+                push_unique_track(&mut out, &mut seen, track, lim);
                 if out.len() >= lim {
                     return out;
                 }
@@ -1499,9 +1531,25 @@ fn parse_collection_tracks(rsp: &Value, lim: usize) -> Vec<Track> {
 
     if out.is_empty() {
         collect_playable_tracks(rsp, &mut seen, &mut out, lim);
+        if let Some(art) = collection_art {
+            for track in &mut out {
+                if track.art.is_none() {
+                    track.art = Some(art.clone());
+                }
+            }
+        }
     }
 
     out
+}
+
+fn collection_track_contents(rsp: &Value) -> Option<&Vec<Value>> {
+    rsp.pointer("/contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/contents/0/musicPlaylistShelfRenderer/contents")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            rsp.pointer("/contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/contents/0/musicShelfRenderer/contents")
+                .and_then(Value::as_array)
+        })
 }
 
 fn parse_artist_page(rsp: &Value, lim: usize) -> (String, Vec<Track>) {
@@ -2228,6 +2276,35 @@ fn artist_page_title(rsp: &Value) -> Option<String> {
         .and_then(|runs| runs_text(runs))
 }
 
+fn browse_page_art(rsp: &Value) -> Option<String> {
+    best_thumbnail(
+        rsp.pointer(
+            "/header/musicResponsiveHeaderRenderer/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails",
+        )
+        .or_else(|| {
+            rsp.pointer(
+                "/header/musicDetailHeaderRenderer/thumbnail/croppedSquareThumbnailRenderer/thumbnail/thumbnails",
+            )
+        })
+        .or_else(|| {
+            rsp.pointer(
+                "/header/musicDetailHeaderRenderer/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails",
+            )
+        })
+        .or_else(|| {
+            rsp.pointer(
+                "/header/musicEditablePlaylistDetailHeaderRenderer/header/musicResponsiveHeaderRenderer/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails",
+            )
+        })
+        .or_else(|| {
+            rsp.pointer(
+                "/contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicResponsiveHeaderRenderer/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails",
+            )
+        })
+        .or_else(|| rsp.pointer("/microformat/microformatDataRenderer/thumbnail/thumbnails")),
+    )
+}
+
 fn browse_page_title(rsp: &Value) -> Option<String> {
     first_str(rsp, &[
         "/header/musicResponsiveHeaderRenderer/title/runs/0/text",
@@ -2480,6 +2557,210 @@ mod tests {
         assert_eq!(
             parse_search_suggestions(&rsp, 8),
             vec!["faded alan walker".to_string(), "faded remix".to_string()]
+        );
+    }
+
+    #[test]
+    fn collection_tracks_use_album_cover_from_music_shelf() {
+        let rsp = json!({
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "secondaryContents": {
+                        "sectionListRenderer": {
+                            "contents": [
+                                {
+                                    "musicShelfRenderer": {
+                                        "contents": [
+                                            {
+                                                "musicResponsiveListItemRenderer": {
+                                                    "flexColumns": [
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [
+                                                                        {
+                                                                            "text": "Welcome To New York",
+                                                                            "navigationEndpoint": {
+                                                                                "watchEndpoint": {
+                                                                                    "videoId": "FsGdznlfE2U"
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            }
+                                                        },
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [
+                                                                        { "text": "Taylor Swift" }
+                                                                    ]
+                                                                }
+                                                            }
+                                                        }
+                                                    ],
+                                                    "fixedColumns": [
+                                                        {
+                                                            "musicResponsiveListItemFixedColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [
+                                                                        { "text": "3:33" }
+                                                                    ]
+                                                                }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "tabs": [
+                        {
+                            "tabRenderer": {
+                                "content": {
+                                    "sectionListRenderer": {
+                                        "contents": [
+                                            {
+                                                "musicResponsiveHeaderRenderer": {
+                                                    "thumbnail": {
+                                                        "musicThumbnailRenderer": {
+                                                            "thumbnail": {
+                                                                "thumbnails": [
+                                                                    {
+                                                                        "url": "https://lh3.googleusercontent.com/abc=w120-h120-l90-rj",
+                                                                        "width": 120,
+                                                                        "height": 120
+                                                                    }
+                                                                ]
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let tracks = parse_collection_tracks(&rsp, 16);
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(
+            tracks[0].art.as_deref(),
+            Some("https://lh3.googleusercontent.com/abc=w720-h720-l90-rj")
+        );
+    }
+
+    #[test]
+    fn collection_tracks_prefer_direct_thumbnail_when_present() {
+        let rsp = json!({
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "secondaryContents": {
+                        "sectionListRenderer": {
+                            "contents": [
+                                {
+                                    "musicPlaylistShelfRenderer": {
+                                        "contents": [
+                                            {
+                                                "musicResponsiveListItemRenderer": {
+                                                    "thumbnail": {
+                                                        "musicThumbnailRenderer": {
+                                                            "thumbnail": {
+                                                                "thumbnails": [
+                                                                    {
+                                                                        "url": "https://lh3.googleusercontent.com/track=w120-h120-l90-rj",
+                                                                        "width": 120,
+                                                                        "height": 120
+                                                                    }
+                                                                ]
+                                                            }
+                                                        }
+                                                    },
+                                                    "flexColumns": [
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [
+                                                                        {
+                                                                            "text": "Track",
+                                                                            "navigationEndpoint": {
+                                                                                "watchEndpoint": {
+                                                                                    "videoId": "video1234567"
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            }
+                                                        },
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [
+                                                                        { "text": "Artist" }
+                                                                    ]
+                                                                }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "tabs": [
+                        {
+                            "tabRenderer": {
+                                "content": {
+                                    "sectionListRenderer": {
+                                        "contents": [
+                                            {
+                                                "musicResponsiveHeaderRenderer": {
+                                                    "thumbnail": {
+                                                        "musicThumbnailRenderer": {
+                                                            "thumbnail": {
+                                                                "thumbnails": [
+                                                                    {
+                                                                        "url": "https://lh3.googleusercontent.com/album=w120-h120-l90-rj",
+                                                                        "width": 120,
+                                                                        "height": 120
+                                                                    }
+                                                                ]
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let tracks = parse_collection_tracks(&rsp, 16);
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(
+            tracks[0].art.as_deref(),
+            Some("https://lh3.googleusercontent.com/track=w720-h720-l90-rj")
         );
     }
 

@@ -31,7 +31,7 @@ impl ArtRenderer {
             return match value.as_str() {
                 "off" | "0" | "false" => Self::Off,
                 "sixel" => Self::Sixel,
-                "wimg" => Self::Wimg,
+                "1" | "true" | "yes" | "on" | "wimg" => Self::Wimg,
                 "blocks" | "block" => Self::Blocks,
                 _ => Self::auto_detect(),
             };

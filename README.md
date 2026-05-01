@@ -99,6 +99,8 @@ rustplayer auth headers-file <headers.json>
 Artwork inline rendering defaults to ANSI blocks. If you want to try inline wimg rendering:
 
 ```bash
+RUSTPLAYER_ART=1
+# or
 RUSTPLAYER_ART=wimg
 ```
 
