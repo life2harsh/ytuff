@@ -39,13 +39,16 @@ rustplayer auth headers-file <headers.json>
 RustPlayer can render artwork inline in the artwork panel. Choose a renderer with:
 
 ```bash
-RUSTPLAYER_ART=blocks   # ANSI blocks (default)
+RUSTPLAYER_ART=kitty    # Kitty graphics protocol
+RUSTPLAYER_ART=blocks   # ANSI blocks fallback
 RUSTPLAYER_ART=sixel    # Sixel-capable terminals
 RUSTPLAYER_ART=1        # Shorthand for wimg
 RUSTPLAYER_ART=wimg     # Uses wimg as a cached inline overlay
 RUSTPLAYER_ART=off       # Disable inline artwork
 ```
 
+Auto mode prefers kitty protocol first, then `wimg` on sixel-capable terminals,
+then ANSI blocks.
 Use `RUSTPLAYER_SIXEL=1` to force sixel rendering on supported terminals.
 `wimg` now runs as an app-managed inline overlay, so no extra `RUSTPLAYER_WIMG_INLINE`
 flag is needed.

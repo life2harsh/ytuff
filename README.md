@@ -96,12 +96,16 @@ rustplayer auth cookie-header "SID=...; SAPISID=..."
 rustplayer auth headers-file <headers.json>
 ```
 
-Artwork inline rendering defaults to ANSI blocks. If you want to try inline wimg rendering:
+Artwork inline rendering now auto-detects the best available path in this order:
+kitty protocol, `wimg` on sixel-capable terminals, then ANSI blocks.
+You can still force a renderer manually:
 
 ```bash
+RUSTPLAYER_ART=kitty
+RUSTPLAYER_ART=blocks
 RUSTPLAYER_ART=1
-# or
 RUSTPLAYER_ART=wimg
+RUSTPLAYER_ART=sixel
 ```
 
 If the inline image looks too wide or too short in your terminal, you can tune the

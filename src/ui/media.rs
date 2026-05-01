@@ -1,5 +1,7 @@
 use super::ScReq;
 use anyhow::Result;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use crossterm::{
     cursor::{RestorePosition, SavePosition},
     queue,
@@ -16,10 +18,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ART_BG: [u8; 3] = [12, 14, 18];
 const GRAPHIC_ART_MAX_EDGE: u32 = 640;
+const KITTY_COVER_IMAGE_ID: u32 = 2001;
+const KITTY_LOGO_IMAGE_ID: u32 = 2002;
+const KITTY_PLACEMENT_ID: u32 = 1;
+const KITTY_CHUNK_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ArtRenderer {
     Off,
+    Kitty,
     Sixel,
     Wimg,
     Blocks,
@@ -31,6 +38,7 @@ impl ArtRenderer {
             let value = value.trim().to_ascii_lowercase();
             return match value.as_str() {
                 "off" | "0" | "false" => Self::Off,
+                "kitty" => Self::Kitty,
                 "sixel" => Self::Sixel,
                 "1" | "true" | "yes" | "on" | "wimg" => Self::Wimg,
                 "blocks" | "block" => Self::Blocks,
@@ -42,8 +50,10 @@ impl ArtRenderer {
     }
 
     fn auto_detect() -> Self {
-        if sixel_on() {
-            Self::Sixel
+        if kitty_on() {
+            Self::Kitty
+        } else if sixel_on() && wimg_on() {
+            Self::Wimg
         } else {
             Self::Blocks
         }
@@ -52,6 +62,7 @@ impl ArtRenderer {
     fn label(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::Kitty => "kitty",
             Self::Sixel => "sixel",
             Self::Wimg => "wimg",
             Self::Blocks => "blocks",
@@ -76,13 +87,22 @@ pub struct Media {
 impl Media {
     pub fn new() -> Self {
         let requested = ArtRenderer::from_env();
+        let kitty_ready = kitty_on();
         let sixel_ready = sixel_on();
+        let wimg_ready = wimg_on();
         let (renderer, renderer_note) = match requested {
             ArtRenderer::Off => (ArtRenderer::Off, None),
+            ArtRenderer::Kitty if kitty_ready => (ArtRenderer::Kitty, Some("protocol".to_string())),
+            ArtRenderer::Kitty => (ArtRenderer::Blocks, Some("kitty unavailable".to_string())),
             ArtRenderer::Sixel if sixel_ready => (ArtRenderer::Sixel, None),
             ArtRenderer::Sixel => (ArtRenderer::Blocks, Some("sixel unavailable".to_string())),
-            ArtRenderer::Wimg if wimg_on() => (ArtRenderer::Wimg, Some("overlay".to_string())),
-            ArtRenderer::Wimg => (ArtRenderer::Blocks, Some("wimg unavailable".to_string())),
+            ArtRenderer::Wimg if wimg_ready && sixel_ready => {
+                (ArtRenderer::Wimg, Some("renderer".to_string()))
+            }
+            ArtRenderer::Wimg if !wimg_ready => {
+                (ArtRenderer::Blocks, Some("wimg unavailable".to_string()))
+            }
+            ArtRenderer::Wimg => (ArtRenderer::Blocks, Some("sixel unavailable".to_string())),
             ArtRenderer::Blocks => (ArtRenderer::Blocks, None),
         };
         Self {
@@ -128,7 +148,9 @@ impl Media {
         match dat {
             Ok(dat) => {
                 let dat = match self.renderer {
-                    ArtRenderer::Sixel | ArtRenderer::Wimg => shrink_art_bytes(dat),
+                    ArtRenderer::Kitty | ArtRenderer::Sixel | ArtRenderer::Wimg => {
+                        shrink_art_bytes(dat)
+                    }
                     ArtRenderer::Off | ArtRenderer::Blocks => dat,
                 };
                 self.enc
@@ -171,6 +193,30 @@ impl Media {
         self.sig = sig;
         self.dirty = false;
 
+        if self.renderer == ArtRenderer::Kitty {
+            self.clear_kitty()?;
+
+            if let Some((key, rect)) = cov {
+                if !hide {
+                    if let Some(frame) = self.frame(key, rect) {
+                        self.draw_frame(rect, &frame)?;
+                    }
+                }
+            }
+
+            if let Some(rect) = logo {
+                if sc_on && !hide {
+                    if let Some(frame) = self.frame_logo(rect) {
+                        self.draw_frame(rect, &frame)?;
+                    }
+                }
+            }
+
+            self.last_cov = cov.map(|(_, rect)| rect);
+            self.last_logo = logo;
+            return Ok(());
+        }
+
         let next_cov = cov.map(|(_, rect)| rect);
         let next_logo = logo;
         if let Some(rect) = self.last_cov.filter(|prev| Some(*prev) != next_cov) {
@@ -211,6 +257,7 @@ impl Media {
     fn frame(&mut self, key: &str, rect: Rect) -> Option<Vec<u8>> {
         match self.renderer {
             ArtRenderer::Off => None,
+            ArtRenderer::Kitty => self.frame_kitty(key, rect),
             ArtRenderer::Sixel => self.frame_sixel(key, rect),
             ArtRenderer::Blocks => self.frame_blocks(key, rect),
             ArtRenderer::Wimg => self.frame_wimg(key, rect),
@@ -220,6 +267,7 @@ impl Media {
     fn frame_logo(&mut self, rect: Rect) -> Option<Vec<u8>> {
         match self.renderer {
             ArtRenderer::Off => None,
+            ArtRenderer::Kitty => self.frame_logo_kitty(rect),
             ArtRenderer::Sixel => self.frame_logo_sixel(rect),
             ArtRenderer::Wimg => self.frame_logo_wimg(rect),
             ArtRenderer::Blocks => self.frame_logo_blocks(rect),
@@ -229,10 +277,23 @@ impl Media {
     fn draw_blank(&self, rect: Rect) -> Result<()> {
         match self.renderer {
             ArtRenderer::Off => Ok(()),
+            ArtRenderer::Kitty => Ok(()),
             ArtRenderer::Sixel => self.draw_blank_sixel(rect),
             ArtRenderer::Wimg => self.draw_blank_sixel(rect),
             ArtRenderer::Blocks => self.draw_blank_blocks(rect),
         }
+    }
+
+    fn frame_kitty(&mut self, key: &str, rect: Rect) -> Option<Vec<u8>> {
+        let ck = format!("kitty:cov:{key}:{}x{}", rect.width, rect.height);
+        if let Some(buf) = self.enc.get(&ck) {
+            return Some(buf.clone());
+        }
+        let dat = self.raw.get(key)?;
+        let img = image::load_from_memory(dat).ok()?;
+        let buf = enc_kitty(img, rect, KITTY_COVER_IMAGE_ID, KITTY_PLACEMENT_ID).ok()?;
+        self.enc.insert(ck, buf.clone());
+        Some(buf)
     }
 
     fn frame_sixel(&mut self, key: &str, rect: Rect) -> Option<Vec<u8>> {
@@ -282,6 +343,17 @@ impl Media {
         Some(buf)
     }
 
+    fn frame_logo_kitty(&mut self, rect: Rect) -> Option<Vec<u8>> {
+        let ck = format!("kitty:logo:{}x{}", rect.width, rect.height);
+        if let Some(buf) = self.enc.get(&ck) {
+            return Some(buf.clone());
+        }
+        let img = image::load_from_memory(&self.logo).ok()?;
+        let buf = enc_kitty(img, rect, KITTY_LOGO_IMAGE_ID, KITTY_PLACEMENT_ID).ok()?;
+        self.enc.insert(ck, buf.clone());
+        Some(buf)
+    }
+
     fn frame_logo_blocks(&mut self, rect: Rect) -> Option<Vec<u8>> {
         let ck = format!("blocks:logo:{}x{}", rect.width, rect.height);
         if let Some(buf) = self.enc.get(&ck) {
@@ -326,8 +398,20 @@ impl Media {
         match self.renderer {
             ArtRenderer::Off => Ok(()),
             ArtRenderer::Blocks => self.out_blocks(rect, buf),
-            ArtRenderer::Sixel | ArtRenderer::Wimg => self.out_graphic(rect, buf),
+            ArtRenderer::Kitty | ArtRenderer::Sixel | ArtRenderer::Wimg => {
+                self.out_graphic(rect, buf)
+            }
         }
+    }
+
+    fn clear_kitty(&self) -> Result<()> {
+        let mut out = io::stdout();
+        queue!(out, SavePosition)?;
+        out.write_all(&kitty_delete(KITTY_COVER_IMAGE_ID, KITTY_PLACEMENT_ID))?;
+        out.write_all(&kitty_delete(KITTY_LOGO_IMAGE_ID, KITTY_PLACEMENT_ID))?;
+        queue!(out, RestorePosition)?;
+        out.flush()?;
+        Ok(())
     }
 
     fn out_blocks(&self, rect: Rect, buf: &[u8]) -> Result<()> {
@@ -438,6 +522,14 @@ fn enc_wimg(img: DynamicImage, rect: Rect) -> Result<Vec<u8>> {
     }
 
     Ok(normalize_graphic(output.stdout))
+}
+
+fn enc_kitty(img: DynamicImage, rect: Rect, image_id: u32, placement_id: u32) -> Result<Vec<u8>> {
+    let rgb = fit_to_canvas(img, rect);
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgb8(rgb)
+        .write_to(&mut Cursor::new(&mut png), ImageOutputFormat::Png)?;
+    Ok(wrap_kitty_png(png, rect, image_id, placement_id))
 }
 
 fn enc_blank_blocks(rect: Rect) -> Vec<u8> {
@@ -756,6 +848,42 @@ fn sixel_on() -> bool {
     false
 }
 
+fn kitty_on() -> bool {
+    if let Ok(v) = env::var("RUSTPLAYER_KITTY") {
+        let v = v.trim().to_ascii_lowercase();
+        if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
+            return true;
+        }
+        if matches!(v.as_str(), "0" | "false" | "no" | "off") {
+            return false;
+        }
+    }
+
+    if env::var_os("KITTY_WINDOW_ID").is_some() || env::var_os("KITTY_PID").is_some() {
+        return true;
+    }
+
+    if env::var_os("WEZTERM_EXECUTABLE").is_some() || env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
+    {
+        return true;
+    }
+
+    if let Ok(term) = env::var("TERM") {
+        let term = term.to_ascii_lowercase();
+        if term.contains("kitty") {
+            return true;
+        }
+    }
+
+    if let Ok(prog) = env::var("TERM_PROGRAM") {
+        if prog.eq_ignore_ascii_case("wezterm") || prog.eq_ignore_ascii_case("ghostty") {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn art_cell_pixels() -> (u32, u32) {
     let (default_w, default_h) = if cfg!(windows) { (8, 16) } else { (10, 20) };
     let w = env_u32("RUSTPLAYER_ART_CELL_W").unwrap_or(default_w).max(1);
@@ -773,6 +901,36 @@ fn wrap_sixel(six: String) -> Vec<u8> {
     out.extend_from_slice(six.as_bytes());
     out.extend_from_slice(b"\x1b\\");
     out
+}
+
+fn wrap_kitty_png(png: Vec<u8>, rect: Rect, image_id: u32, placement_id: u32) -> Vec<u8> {
+    let encoded = BASE64.encode(png);
+    let total_chunks = encoded.len().div_ceil(KITTY_CHUNK_SIZE);
+    let mut out = Vec::with_capacity(encoded.len() + total_chunks.saturating_mul(64));
+
+    for (index, chunk) in encoded.as_bytes().chunks(KITTY_CHUNK_SIZE).enumerate() {
+        let more = if index + 1 < total_chunks { 1 } else { 0 };
+        if index == 0 {
+            out.extend_from_slice(
+                format!(
+                    "\x1b_Ga=T,q=2,f=100,i={image_id},p={placement_id},c={},r={},m={more};",
+                    rect.width.max(1),
+                    rect.height.max(1)
+                )
+                .as_bytes(),
+            );
+        } else {
+            out.extend_from_slice(format!("\x1b_Gq=2,m={more};").as_bytes());
+        }
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(b"\x1b\\");
+    }
+
+    out
+}
+
+fn kitty_delete(image_id: u32, placement_id: u32) -> Vec<u8> {
+    format!("\x1b_Ga=d,d=I,q=2,i={image_id},p={placement_id}\x1b\\").into_bytes()
 }
 
 fn normalize_graphic(buf: Vec<u8>) -> Vec<u8> {
@@ -808,4 +966,26 @@ fn temp_wimg_path() -> std::path::PathBuf {
         std::process::id()
     ));
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kitty_wrap_includes_metadata_and_final_chunk() {
+        let payload = vec![42u8; 8000];
+        let rect = Rect::new(0, 0, 12, 6);
+        let wrapped = String::from_utf8(wrap_kitty_png(payload, rect, 77, 9)).unwrap();
+
+        assert!(wrapped.contains("\x1b_Ga=T,q=2,f=100,i=77,p=9,c=12,r=6,m=1;"));
+        assert!(wrapped.contains("\x1b_Gq=2,m=0;"));
+        assert!(wrapped.ends_with("\x1b\\"));
+    }
+
+    #[test]
+    fn kitty_delete_targets_specific_image_and_placement() {
+        let delete = String::from_utf8(kitty_delete(77, 9)).unwrap();
+        assert_eq!(delete, "\x1b_Ga=d,d=I,q=2,i=77,p=9\x1b\\");
+    }
 }

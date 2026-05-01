@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
+use std::path::Path;
+use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
 use aes_gcm::aead::{generic_array::GenericArray, Aead, KeyInit};

@@ -182,7 +182,8 @@ fn pick_best_match(
         let candidate_title = item.track_name.as_deref().unwrap_or_default();
         let title_score = compare_title(title, candidate_title);
         if title_score < 65 {
-            continue;}
+            continue;
+        }
         let artist_score = match artist {
             Some(artist) => compare_artist(artist, item.artist_name.as_deref().unwrap_or_default()),
             None => 70,
@@ -227,7 +228,8 @@ fn compare_title(expected: &str, candidate: &str) -> u16 {
         return 0;
     }
     if expected_raw == candidate_raw {
-        return 100; }
+        return 100;
+    }
     let expected_clean = normalize_phrase(expected, true);
     let candidate_clean = normalize_phrase(candidate, true);
     if !expected_clean.is_empty() && expected_clean == candidate_clean {
@@ -458,9 +460,7 @@ fn map_item(item: LrcLibItem) -> LyricsDoc {
     }
 }
 
-fn deserialize_duration_opt<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<u64>, D::Error>
+fn deserialize_duration_opt<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
 where
     D: Deserializer<'de>,
 {

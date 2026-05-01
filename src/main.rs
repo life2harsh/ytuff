@@ -22,9 +22,15 @@ use crate::playlist::PlaylistStore;
 use crate::sources::soundcloud::{Ql, SoundCloudClient};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(target_os = "linux")]
+use libc::{close, dup, dup2, STDERR_FILENO};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command as ProcessCommand;
@@ -36,7 +42,7 @@ use url::Url;
     name = "rustplayer",
     version,
     about = "A high-performance terminal music player with YouTube streaming",
-    after_help = "Auth note:\n  On Windows, RustPlayer can open a dedicated YouTube Music login window with\n  'rustplayer auth login'.\n  Manual cookie login is still supported through\n  'rustplayer auth cookie-file <cookies.txt>' or\n  'rustplayer auth cookie-header \"SID=...; SAPISID=...\"'.\n  You can also import ytmusicapi headers.json via\n  'rustplayer auth headers-file <headers.json>'.\n\nExamples:\n  rustplayer auth login\n  rustplayer auth show\n  rustplayer auth headers-file headers.json\n  rustplayer status\n  rustplayer play \"never gonna give you up\"\n  rustplayer download \"https://music.youtube.com/watch?v=lYBUbBu4W08\" --format mp3\n  rustplayer playlist create mix"
+    after_help = "Auth note:\n  On Windows and Linux, RustPlayer can open a dedicated YouTube Music login window with\n  'rustplayer auth login'.\n  Manual cookie login is still supported through\n  'rustplayer auth cookie-file <cookies.txt>' or\n  'rustplayer auth cookie-header \"SID=...; SAPISID=...\"'.\n  You can also import ytmusicapi headers.json via\n  'rustplayer auth headers-file <headers.json>'.\n\nExamples:\n  rustplayer auth login\n  rustplayer auth show\n  rustplayer auth headers-file headers.json\n  rustplayer status\n  rustplayer play \"never gonna give you up\"\n  rustplayer download \"https://music.youtube.com/watch?v=lYBUbBu4W08\" --format mp3\n  rustplayer playlist create mix"
 )]
 struct Cli {
     #[arg(short = 'p', long = "path", global = true, value_name = "DIR")]
@@ -203,6 +209,55 @@ impl From<DownloadFormatArg> for DownloadFormat {
 struct SearchResults {
     local: Vec<Track>,
     youtube: Vec<Track>,
+}
+
+#[cfg(target_os = "linux")]
+struct NativeStderrGuard {
+    saved_fd: i32,
+    _log_file: fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for NativeStderrGuard {
+    fn drop(&mut self) {
+        unsafe {
+            dup2(self.saved_fd, STDERR_FILENO);
+            close(self.saved_fd);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn redirect_native_stderr(paths: &AppPaths) -> Option<NativeStderrGuard> {
+    fs::create_dir_all(&paths.cache_dir).ok()?;
+    let log_path = paths.cache_dir.join("native-stderr.log");
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .ok()?;
+
+    let saved_fd = unsafe { dup(STDERR_FILENO) };
+    if saved_fd < 0 {
+        return None;
+    }
+
+    if unsafe { dup2(log_file.as_raw_fd(), STDERR_FILENO) } < 0 {
+        unsafe {
+            close(saved_fd);
+        }
+        return None;
+    }
+
+    Some(NativeStderrGuard {
+        saved_fd,
+        _log_file: log_file,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn redirect_native_stderr(_paths: &AppPaths) -> Option<()> {
+    None
 }
 
 fn main() -> Result<()> {
@@ -439,6 +494,7 @@ fn remote_collection_url(input: &str, browse_id: &str) -> String {
 }
 
 fn run_tui(runtime: &Runtime) -> Result<()> {
+    let _native_stderr = redirect_native_stderr(&runtime.paths);
     let core = runtime.build_core();
     let ui_client = Arc::new(Mutex::new(runtime.make_client()?));
     let playback_client = Arc::new(Mutex::new(runtime.make_client()?));

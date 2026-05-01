@@ -1899,7 +1899,7 @@ fn draw_art_box(f: &mut Frame, app: &mut App, area: Rect) {
             &[
                 "Artwork disabled",
                 "set RUSTPLAYER_ART=blocks",
-                "or set RUSTPLAYER_ART=1/wimg/sixel",
+                "or set RUSTPLAYER_ART=kitty/wimg/sixel",
             ],
             Alignment::Left,
         );
@@ -2327,7 +2327,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "CLI / Auth",
             Style::default().fg(Color::Yellow).bold(),
         )),
-        Line::from("l opens a dedicated YouTube Music login window on Windows"),
+        Line::from("l opens a dedicated YouTube Music login window on Windows or Linux"),
         Line::from("L clears the current in-app YouTube session"),
         Line::from("personalized home and library playlists use the captured session"),
         Line::from("use: rustplayer auth cookie-file <cookies.txt>"),
