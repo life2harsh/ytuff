@@ -3,6 +3,7 @@ use crate::core::Core;
 use crate::daemon::{send_request, RpcRequest};
 use crate::playback::{PlaybackCommand, PlaybackHandle, RepeatMode};
 use anyhow::{anyhow, Result};
+use std::cell::Cell;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -29,7 +30,7 @@ pub fn start_daemon_playback_proxy(core: Core, daemon_addr: String) -> PlaybackH
     let position_bg = Arc::clone(&position);
 
     thread::spawn(move || {
-        let mut last_autoplay: Option<bool> = None;
+        let last_autoplay = Cell::new(None::<bool>);
         let mut last_repeat: Option<RepeatMode> = None;
         let mut last_shuffle: Option<bool> = None;
         let mut last_volume: Option<f32> = None;
@@ -45,8 +46,8 @@ pub fn start_daemon_playback_proxy(core: Core, daemon_addr: String) -> PlaybackH
                 status.is_playing,
             ));
 
-            if last_autoplay != Some(status.autoplay) {
-                last_autoplay = Some(status.autoplay);
+            if last_autoplay.get() != Some(status.autoplay) {
+                last_autoplay.set(Some(status.autoplay));
                 let _ = autoplay_tx.send(status.autoplay);
             }
 
@@ -83,11 +84,12 @@ pub fn start_daemon_playback_proxy(core: Core, daemon_addr: String) -> PlaybackH
 
             match rx.recv_timeout(timeout) {
                 Ok(cmd) => {
+                    let autoplay = last_autoplay.get();
                     if let Err(err) = handle_command(
                         &core_bg,
                         &daemon_addr_bg,
                         cmd,
-                        last_autoplay,
+                        autoplay,
                         &msg_tx,
                         &mut apply_status,
                     ) {
@@ -229,7 +231,6 @@ fn ordered_tracks(core: &Core, ids: &[String], start_index: usize) -> Result<Vec
 }
 
 fn sync_core_from_status(core: &Core, status: &crate::daemon::PlayerStatus) {
-    core.set_sc(status.sc_on);
     core.clear_queue();
 
     if let Some(track) = status.current.as_ref() {

@@ -70,52 +70,8 @@ pub fn run_tray(paths: AppPaths, _cfg: AppConfig) -> Result<()> {
 mod linux {
     use super::*;
 
-    pub fn run(exe: std::path::PathBuf) -> Result<()> {
-        use gtk::prelude::*;
-
-        gtk::init().map_err(|e| anyhow!("Failed to init GTK: {e}"))?;
-
-        let icon = gtk::StatusIcon::new_from_icon_name(Some("media-playback-start"));
-        icon.set_tooltip_text(Some("RustPlayer"));
-        icon.set_visible(true);
-
-        icon.connect_activate(move |_| {
-            let _ = spawn_restore_ui(&exe);
-        });
-
-        gtk::main();
-        Ok(())
-    }
-
-    fn spawn_restore_ui(exe: &std::path::Path) -> Result<()> {
-        // Try a few common terminal emulators.
-        let exe_str = exe.to_string_lossy().to_string();
-
-        let candidates: &[(&str, &[&str])] = &[
-            ("x-terminal-emulator", &["-e"]),
-            ("gnome-terminal", &["--"]),
-            ("konsole", &["-e"]),
-            ("xfce4-terminal", &["-e"]),
-            ("alacritty", &["-e"]),
-            ("kitty", &["-e"]),
-            ("xterm", &["-e"]),
-        ];
-
-        for (term, prefix_args) in candidates {
-            let mut cmd = Command::new(term);
-            cmd.args(*prefix_args)
-                .arg(&exe_str)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            if cmd.spawn().is_ok() {
-                return Ok(());
-            }
-        }
-
-        Err(anyhow!(
-            "Could not find a terminal emulator to launch RustPlayer"
-        ))
+    pub fn run(_exe: std::path::PathBuf) -> Result<()> {
+        Err(anyhow!("System tray is not supported on this GTK version"))
     }
 }
 
