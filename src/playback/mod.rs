@@ -34,6 +34,7 @@ const AUTOPLAY_REFILL_THRESHOLD: usize = 4;
 #[derive(Debug, Clone)]
 pub enum PlaybackCommand {
     PlayIndex(usize),
+    PlayNow(String),
     PlayTrack(String),
     PlayCollection {
         ids: Vec<String>,
@@ -1474,6 +1475,12 @@ pub fn start_audio_thread(
                                 .send("The selected track is no longer available".to_string())
                                 .ok();
                         }
+                    }
+                    PlaybackCommand::PlayNow(id) => {
+                        core.clear_queue();
+                        active_collection = None;
+                        last_finished_track_id = None;
+                        tx_clone.send(PlaybackCommand::PlayTrack(id)).ok();
                     }
                     PlaybackCommand::PrefetchTrack(id) => {
                         let Some(track) = core.track(&id) else {

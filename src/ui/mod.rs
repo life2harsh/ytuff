@@ -305,7 +305,9 @@ impl App {
             }
         }
         if let Some(id) = self.pick_id() {
-            let _ = self.pb.tx.send(PlaybackCommand::PlayTrack(id));
+            self.core.clear_queue();
+            self.q_st.select(Some(0));
+            let _ = self.pb.tx.send(PlaybackCommand::PlayNow(id));
         }
     }
 
@@ -388,6 +390,12 @@ impl App {
             self.core.enqueue(id);
         }
         self.note("collection queued");
+    }
+
+    fn clear_queue(&mut self) {
+        self.core.clear_queue();
+        self.q_st.select(Some(0));
+        self.note("queue cleared");
     }
 
     fn pick_track(&self) -> Option<Track> {
@@ -1253,6 +1261,7 @@ pub fn run_ui(
                             let _ = app.pb.tx.send(PlaybackCommand::ToggleShuffle);
                         }
                         KeyCode::Char('a') => app.add_q(),
+                        KeyCode::Char('c') => app.clear_queue(),
                         KeyCode::Char('P') => app.play_collection_action(),
                         KeyCode::Char('Q') => app.queue_collection_action(),
                         KeyCode::Enter => app.activate_sel(),
@@ -2249,6 +2258,8 @@ fn draw_foot(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(" play  "),
         hot("a"),
         Span::raw(" queue  "),
+        hot("c"),
+        Span::raw(" clear queue  "),
         hot("P/Q"),
         Span::raw(" play/queue collection  "),
         hot("A"),
@@ -2295,6 +2306,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("enter play track, or open a selected youtube playlist or album"),
         Line::from("tab accept selected live suggestion in youtube search"),
         Line::from("a add selected track to queue"),
+        Line::from("c clear the current queue"),
         Line::from("P play a selected playlist/album, or restart the open collection"),
         Line::from("Q queue a selected playlist/album, or queue the open collection"),
         Line::from("space pause, r resume, n next, p prev"),

@@ -5,12 +5,14 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
+const LRCLIB_GET: &str = "https://lrclib.net/api/get";
 const LRCLIB_SEARCH: &str = "https://lrclib.net/api/search";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -36,6 +38,7 @@ struct LrcLibItem {
     track_name: Option<String>,
     artist_name: Option<String>,
     album_name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_duration_opt")]
     duration: Option<u64>,
     plain_lyrics: Option<String>,
     synced_lyrics: Option<String>,
@@ -90,8 +93,37 @@ impl LyricsClient {
         }
 
         let artist = track_artist(track);
+        if artist.is_some() || track.dur.is_some() {
+            if let Some(item) = self.get_track(title, artist.as_deref(), track.dur)? {
+                return Ok(Some(map_item(item)));
+            }
+        }
         let items = self.search_track(title, artist.as_deref())?;
         Ok(pick_best_match(title, artist.as_deref(), track.dur, items))
+    }
+
+    fn get_track(
+        &self,
+        title: &str,
+        artist: Option<&str>,
+        duration: Option<u64>,
+    ) -> Result<Option<LrcLibItem>> {
+        let mut params = vec![("track_name".to_string(), title.to_string())];
+        if let Some(artist) = artist {
+            params.push(("artist_name".to_string(), artist.to_string()));
+        }
+        if let Some(duration) = duration {
+            params.push(("duration".to_string(), duration.to_string()));
+        }
+
+        let rsp = self.http.get(LRCLIB_GET).query(&params).send()?;
+        if matches!(
+            rsp.status(),
+            StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(rsp.error_for_status()?.json::<LrcLibItem>()?))
     }
 
     fn search_track(&self, title: &str, artist: Option<&str>) -> Result<Vec<LrcLibItem>> {
@@ -150,9 +182,7 @@ fn pick_best_match(
         let candidate_title = item.track_name.as_deref().unwrap_or_default();
         let title_score = compare_title(title, candidate_title);
         if title_score < 65 {
-            continue;
-        }
-
+            continue;}
         let artist_score = match artist {
             Some(artist) => compare_artist(artist, item.artist_name.as_deref().unwrap_or_default()),
             None => 70,
@@ -160,7 +190,6 @@ fn pick_best_match(
         if artist.is_some() && artist_score < 35 {
             continue;
         }
-
         let total = title_score as i32 * 7
             + artist_score as i32 * 3
             + compare_duration(duration, item.duration);
@@ -198,9 +227,7 @@ fn compare_title(expected: &str, candidate: &str) -> u16 {
         return 0;
     }
     if expected_raw == candidate_raw {
-        return 100;
-    }
-
+        return 100; }
     let expected_clean = normalize_phrase(expected, true);
     let candidate_clean = normalize_phrase(candidate, true);
     if !expected_clean.is_empty() && expected_clean == candidate_clean {
@@ -227,7 +254,6 @@ fn compare_artist(expected: &str, candidate: &str) -> u16 {
     if expected_raw == candidate_raw {
         return 100;
     }
-
     let expected_aliases = artist_aliases(expected);
     let candidate_aliases = artist_aliases(candidate);
     if expected_aliases
@@ -236,7 +262,6 @@ fn compare_artist(expected: &str, candidate: &str) -> u16 {
     {
         return 94;
     }
-
     overlap_score(
         &tokens_from_aliases(&expected_aliases),
         &tokens_from_aliases(&candidate_aliases),
@@ -433,6 +458,31 @@ fn map_item(item: LrcLibItem) -> LyricsDoc {
     }
 }
 
+fn deserialize_duration_opt<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let duration = match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_f64().map(|value| value.round() as u64)),
+        serde_json::Value::String(text) => text
+            .parse::<u64>()
+            .ok()
+            .or_else(|| text.parse::<f64>().ok().map(|value| value.round() as u64)),
+        _ => None,
+    };
+
+    Ok(duration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +525,20 @@ mod tests {
 
         assert_eq!(picked.track_name.as_deref(), Some("ivy"));
         assert_eq!(picked.artist_name.as_deref(), Some("Taylor Swift"));
+    }
+
+    #[test]
+    fn duration_deserializer_accepts_float_values() {
+        let item = serde_json::from_str::<LrcLibItem>(
+            r#"{
+                "id": 1,
+                "trackName": "ivy",
+                "artistName": "Taylor Swift",
+                "duration": 260.0
+            }"#,
+        )
+        .expect("duration should deserialize");
+
+        assert_eq!(item.duration, Some(260));
     }
 }

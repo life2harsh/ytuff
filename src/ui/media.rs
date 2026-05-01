@@ -4,17 +4,18 @@ use crossterm::{
     cursor::{RestorePosition, SavePosition},
     queue,
 };
-use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
+use image::{DynamicImage, GenericImageView, ImageOutputFormat, Rgb, RgbImage};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Cursor, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ART_BG: [u8; 3] = [12, 14, 18];
+const GRAPHIC_ART_MAX_EDGE: u32 = 640;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ArtRenderer {
@@ -126,6 +127,12 @@ impl Media {
         self.fly.remove(&key);
         match dat {
             Ok(dat) => {
+                let dat = match self.renderer {
+                    ArtRenderer::Sixel | ArtRenderer::Wimg => shrink_art_bytes(dat),
+                    ArtRenderer::Off | ArtRenderer::Blocks => dat,
+                };
+                self.enc
+                    .retain(|cache_key, _| !cache_key.contains(&format!(":cov:{key}:")));
                 self.raw.insert(key, dat);
             }
             Err(_) => {
@@ -451,6 +458,32 @@ fn enc_blank_blocks(rect: Rect) -> Vec<u8> {
         }
     }
     out.into_bytes()
+}
+
+fn shrink_art_bytes(dat: Vec<u8>) -> Vec<u8> {
+    let Ok(img) = image::load_from_memory(&dat) else {
+        return dat;
+    };
+    let (w, h) = img.dimensions();
+    if w.max(h) <= GRAPHIC_ART_MAX_EDGE {
+        return dat;
+    }
+
+    let resized = img.resize(
+        GRAPHIC_ART_MAX_EDGE,
+        GRAPHIC_ART_MAX_EDGE,
+        image::imageops::FilterType::Triangle,
+    );
+    let mut out = Vec::new();
+    if resized
+        .write_to(&mut Cursor::new(&mut out), ImageOutputFormat::Png)
+        .is_ok()
+        && !out.is_empty()
+    {
+        out
+    } else {
+        dat
+    }
 }
 
 fn fit_to_canvas(img: DynamicImage, rect: Rect) -> RgbImage {

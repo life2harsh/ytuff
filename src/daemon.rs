@@ -207,9 +207,10 @@ fn apply_request(request: RpcRequest, state: &Arc<SharedState>) -> Result<String
         RpcRequest::Status => Ok("status".to_string()),
         RpcRequest::PlayTrack { track } => {
             put_track(state, &track);
+            state.core.clear_queue();
             state
                 .pb_tx
-                .send(PlaybackCommand::PlayTrack(track.id.clone()))?;
+                .send(PlaybackCommand::PlayNow(track.id.clone()))?;
             Ok(format!("playing {}", track.title))
         }
         RpcRequest::PlayTracks { tracks } => {
