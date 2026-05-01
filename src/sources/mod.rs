@@ -1,2 +1,3 @@
 pub mod local;
-pub mod soundcloud;
+pub mod youtube;
+pub use youtube as soundcloud;
