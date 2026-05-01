@@ -7,6 +7,7 @@ use rodio::buffer::SamplesBuffer;
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use rustfft::{algorithm::Radix4, Fft, FftDirection};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek};
@@ -46,6 +47,9 @@ pub enum PlaybackCommand {
     Pause,
     Resume,
     Stop,
+    Enqueue(String),
+    EnqueueMany(Vec<String>),
+    ClearQueue,
     TogglePause,
     Next,
     Prev,
@@ -72,7 +76,7 @@ pub enum CollectionKind {
     Album,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepeatMode {
     Off,
     All,
@@ -1623,6 +1627,17 @@ pub fn start_audio_thread(
                             shuffle_enabled = false;
                             shuffle_tx.send(false).ok();
                         }
+                    }
+                    PlaybackCommand::Enqueue(id) => {
+                        core.enqueue(id);
+                    }
+                    PlaybackCommand::EnqueueMany(ids) => {
+                        for id in ids {
+                            core.enqueue(id);
+                        }
+                    }
+                    PlaybackCommand::ClearQueue => {
+                        core.clear_queue();
                     }
                     PlaybackCommand::VolumeUp => {
                         volume = (volume + 0.1).min(1.0);

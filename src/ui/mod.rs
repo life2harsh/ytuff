@@ -305,7 +305,6 @@ impl App {
             }
         }
         if let Some(id) = self.pick_id() {
-            self.core.clear_queue();
             self.q_st.select(Some(0));
             let _ = self.pb.tx.send(PlaybackCommand::PlayNow(id));
         }
@@ -330,7 +329,7 @@ impl App {
                 return;
             }
             let id = track.id;
-            self.core.enqueue(id);
+            let _ = self.pb.tx.send(PlaybackCommand::Enqueue(id));
             self.note("queued");
         }
     }
@@ -386,14 +385,12 @@ impl App {
             self.note("open a playlist or album first");
             return;
         };
-        for id in ids {
-            self.core.enqueue(id);
-        }
+        let _ = self.pb.tx.send(PlaybackCommand::EnqueueMany(ids));
         self.note("collection queued");
     }
 
     fn clear_queue(&mut self) {
-        self.core.clear_queue();
+        let _ = self.pb.tx.send(PlaybackCommand::ClearQueue);
         self.q_st.select(Some(0));
         self.note("queue cleared");
     }
@@ -957,9 +954,7 @@ pub fn run_ui(
                                     app.note("collection started");
                                 }
                                 CollectionAction::Enqueue => {
-                                    for id in ids {
-                                        app.core.enqueue(id);
-                                    }
+                                    let _ = app.pb.tx.send(PlaybackCommand::EnqueueMany(ids));
                                     app.note("collection queued");
                                 }
                             }
@@ -1018,6 +1013,13 @@ pub fn run_ui(
         if let Ok(ev) = rx.recv_timeout(Duration::from_millis(50)) {
             match ev {
                 CEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                    if !app.inp && key.code == KeyCode::Char('M') {
+                        match crate::tray::spawn_tray_process() {
+                            Ok(()) => break,
+                            Err(err) => app.note(format!("tray error: {err}")),
+                        }
+                    }
+
                     if app.show_help {
                         match key.code {
                             KeyCode::Esc
@@ -2322,6 +2324,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("+/- volume, 0 mute"),
         Line::from("d audio devices, F local folders"),
         Line::from("v visualizer, j/k move, J/K queue"),
+        Line::from("M minimize to tray (keep playback running)"),
         Line::from(""),
         Line::from(Span::styled(
             "CLI / Auth",
@@ -2337,7 +2340,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("lyrics  : rustplayer lyrics [--cached] [--json]"),
         Line::from("download: rustplayer download <url> --format m4a|mp3"),
         Line::from("control : rustplayer status | play | pause | next"),
-        Line::from("q or esc closes overlays, q quits app"),
+        Line::from("q or esc closes overlays, q quits app, M minimizes to tray"),
     ];
     let p = Paragraph::new(Text::from(lines))
         .block(

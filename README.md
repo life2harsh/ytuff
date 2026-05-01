@@ -83,7 +83,10 @@ rustplayer --path "/path/to/music" --soundcloud
 | `r` | Resume playback |
 | `n` | Skip to next track |
 | `j` / `k` or `↓` / `↑` | Navigate track list |
+| `Shift` + `m` | Minimize to system tray (keeps playback/session running) |
 | `q` | Exit application |
+
+Tip: After minimizing, running `rustplayer` again reattaches to the current session.
 
 ### YouTube Music Auth (Optional)
 

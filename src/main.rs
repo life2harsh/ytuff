@@ -1,4 +1,5 @@
 mod appdata;
+mod attach;
 mod auth;
 mod core;
 mod daemon;
@@ -9,6 +10,7 @@ mod playback;
 mod playlist;
 mod resolve;
 mod sources;
+mod tray;
 mod ui;
 
 use crate::appdata::{AppConfig, AppPaths};
@@ -59,6 +61,8 @@ struct Cli {
 enum Command {
     Tui,
     Daemon,
+    #[command(hide = true)]
+    Tray,
     Status,
     Search {
         query: String,
@@ -267,6 +271,7 @@ fn main() -> Result<()> {
     match &cli.command {
         None | Some(Command::Tui) => run_tui(&runtime),
         Some(Command::Daemon) => daemon::run_daemon(runtime.paths.clone(), runtime.cfg.clone()),
+        Some(Command::Tray) => tray::run_tray(runtime.paths.clone(), runtime.cfg.clone()),
         Some(Command::Status) => show_status(&runtime, cli.json),
         Some(Command::Search { query, limit }) => search_tracks(&runtime, query, *limit, cli.json),
         Some(Command::Play { input }) => play_input(&runtime, input),
@@ -495,12 +500,13 @@ fn remote_collection_url(input: &str, browse_id: &str) -> String {
 
 fn run_tui(runtime: &Runtime) -> Result<()> {
     let _native_stderr = redirect_native_stderr(&runtime.paths);
+    daemon::ensure_daemon(&runtime.paths)?;
     let core = runtime.build_core();
     let ui_client = Arc::new(Mutex::new(runtime.make_client()?));
     let playback_client = Arc::new(Mutex::new(runtime.make_client()?));
     let shared_cfg = Arc::new(Mutex::new(runtime.cfg.clone()));
     let playback =
-        playback::start_audio_thread(core.clone(), playback_client.clone(), runtime.cfg.autoplay);
+        attach::start_daemon_playback_proxy(core.clone(), runtime.cfg.daemon_addr.clone());
     ui::run_ui(
         core,
         playback,
