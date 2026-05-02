@@ -20,7 +20,7 @@ const MUSIC_REFERER: &str = "https://music.youtube.com/";
 const VIDEO_ORIGIN: &str = "https://www.youtube.com";
 const VIDEO_REFERER: &str = "https://www.youtube.com/";
 const TV_REFERER: &str = "https://www.youtube.com/tv";
-const WEB_REMIX_CLIENT_VERSION: &str = "1.20260213.01.00";
+const WEB_REMIX_CLIENT_VERSION: &str = "1.20260502.01.00";
 const SEARCH_SONGS_FILTER: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
 const VISITOR_PREFIXES: [&str; 2] = ["Cgt", "Cgs"];
 const STREAM_DOWNLOAD_CHUNK_BYTES: u64 = 1024 * 1024 * 2;
@@ -128,7 +128,7 @@ impl PlaybackClient {
 
     fn client_version(self) -> &'static str {
         match self {
-            Self::AndroidVr => "1.65.10",
+            Self::AndroidVr => "1.70.10",
             Self::WebSafari => "2.20260114.08.00",
             Self::TvDowngraded => "5.20260114",
         }
@@ -885,8 +885,9 @@ impl YouTubeClient {
                 py_args.extend(common_args.clone());
                 run_ytdlp_command("py", &py_args)
             })
+            .or_else(|_| run_ytdlp_command("yt-dlp", &common_args))
             .context(
-                "Could not start yt-dlp. Install it with `python -m pip install --user yt-dlp`.",
+                "Could not start yt-dlp. Install it with `python -m pip install --user yt-dlp` or `winget install yt-dlp`.",
             )?;
 
         if output.status.success() {
@@ -1887,12 +1888,21 @@ fn pick_audio_stream(player: &Value, ql: Ql) -> Option<AudioChoice> {
     let mut mp4_fallback = Vec::new();
     let mut fallback = Vec::new();
 
-    for fmt in player
+    let empty_vec = Vec::new();
+    let formats = player
         .pointer("/streamingData/adaptiveFormats")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+        .unwrap_or(&empty_vec)
+        .iter()
+        .chain(
+            player
+                .pointer("/streamingData/formats")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_vec)
+                .iter(),
+        );
+
+    for fmt in formats {
         let Some(mime) = fmt.get("mimeType").and_then(Value::as_str) else {
             continue;
         };
@@ -1917,9 +1927,11 @@ fn pick_audio_stream(player: &Value, ql: Ql) -> Option<AudioChoice> {
             bitrate,
         };
 
-        if mime.starts_with("audio/mp4") && mime.contains("mp4a.40.2") {
+        if mime.starts_with("audio/mp4")
+            && (mime.contains("mp4a.40.2") || mime.contains("mp4a.40.5"))
+        {
             preferred_mp4.push(choice);
-        } else if mime.starts_with("audio/mp4") {
+        } else if mime.starts_with("audio/mp4") || mime.contains("codecs=\"opus\"") {
             mp4_fallback.push(choice);
         } else {
             fallback.push(choice);

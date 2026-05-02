@@ -1564,60 +1564,70 @@ fn start_sc(
                 }
                 ScReq::DownloadTracks(tracks) => {
                     let cfg_snapshot = cfg.lock().unwrap().clone();
-                    let out_dir = cfg_snapshot.effective_downloads_dir(&paths);
-                    let res = make_client_from_cfg(&cfg_snapshot).and_then(|mut client| {
-                        let total = tracks.len();
-                        for track in &tracks {
-                            download_track(track, &mut client, DownloadFormat::M4a, &out_dir)
-                                .map_err(|err| err.to_string())?;
-                        }
-                        Ok(format!(
-                            "downloaded {} item(s) to {}",
-                            total,
-                            out_dir.display()
-                        ))
+                    let paths_clone = paths.clone();
+                    let etx_clone = etx.clone();
+                    std::thread::spawn(move || {
+                        let out_dir = cfg_snapshot.effective_downloads_dir(&paths_clone);
+                        let res = make_client_from_cfg(&cfg_snapshot).and_then(|mut client| {
+                            let total = tracks.len();
+                            for track in &tracks {
+                                download_track(track, &mut client, DownloadFormat::M4a, &out_dir)
+                                    .map_err(|err| err.to_string())?;
+                            }
+                            Ok(format!(
+                                "downloaded {} item(s) to {}",
+                                total,
+                                out_dir.display()
+                            ))
+                        });
+                        let _ = etx_clone.send(ScEvt::Notice(match res {
+                            Ok(msg) => msg,
+                            Err(err) => err,
+                        }));
                     });
-                    let _ = etx.send(ScEvt::Notice(match res {
-                        Ok(msg) => msg,
-                        Err(err) => err,
-                    }));
                 }
                 ScReq::DownloadCollection(id, fallback_title) => {
                     let cfg_snapshot = cfg.lock().unwrap().clone();
-                    let out_dir = cfg_snapshot.effective_downloads_dir(&paths);
-                    let res = make_client_from_cfg(&cfg_snapshot).and_then(|mut client| {
-                        let (title, items) = client
-                            .browse_page(&id, 200)
-                            .map_err(|err| err.to_string())?;
-                        let playable = items
-                            .into_iter()
-                            .filter(|track| {
-                                track.is_playable_remote() && track.acc != Some(Acc::Block)
-                            })
-                            .collect::<Vec<_>>();
-                        if playable.is_empty() {
-                            return Err("no playable tracks were found in that collection".into());
-                        }
-                        let total = playable.len();
-                        for track in &playable {
-                            download_track(track, &mut client, DownloadFormat::M4a, &out_dir)
+                    let paths_clone = paths.clone();
+                    let etx_clone = etx.clone();
+                    std::thread::spawn(move || {
+                        let out_dir = cfg_snapshot.effective_downloads_dir(&paths_clone);
+                        let res = make_client_from_cfg(&cfg_snapshot).and_then(|mut client| {
+                            let (title, items) = client
+                                .browse_page(&id, 200)
                                 .map_err(|err| err.to_string())?;
-                        }
-                        Ok(format!(
-                            "downloaded {} track(s) from {} to {}",
-                            total,
-                            if title.trim().is_empty() {
-                                fallback_title
-                            } else {
-                                title
-                            },
-                            out_dir.display()
-                        ))
+                            let playable = items
+                                .into_iter()
+                                .filter(|track| {
+                                    track.is_playable_remote() && track.acc != Some(Acc::Block)
+                                })
+                                .collect::<Vec<_>>();
+                            if playable.is_empty() {
+                                return Err(
+                                    "no playable tracks were found in that collection".into()
+                                );
+                            }
+                            let total = playable.len();
+                            for track in &playable {
+                                download_track(track, &mut client, DownloadFormat::M4a, &out_dir)
+                                    .map_err(|err| err.to_string())?;
+                            }
+                            Ok(format!(
+                                "downloaded {} track(s) from {} to {}",
+                                total,
+                                if title.trim().is_empty() {
+                                    fallback_title
+                                } else {
+                                    title
+                                },
+                                out_dir.display()
+                            ))
+                        });
+                        let _ = etx_clone.send(ScEvt::Notice(match res {
+                            Ok(msg) => msg,
+                            Err(err) => err,
+                        }));
                     });
-                    let _ = etx.send(ScEvt::Notice(match res {
-                        Ok(msg) => msg,
-                        Err(err) => err,
-                    }));
                 }
             }
         }

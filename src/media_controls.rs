@@ -1,11 +1,11 @@
 use crate::core::track::Track;
 use crate::playback::PlaybackCommand;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
     SeekDirection,
 };
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
 pub struct MediaSession {
@@ -205,7 +205,7 @@ impl HiddenWindow {
     fn new() -> Result<Self> {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(usize, u32)>>();
         let join = std::thread::spawn(move || run_hidden_window(ready_tx));
-        let (hwnd, thread_id) = ready_rx
+        let (hwnd, thread_id): (usize, u32) = ready_rx
             .recv_timeout(Duration::from_secs(5))
             .context("Timed out creating the media-control window")??;
         Ok(Self {

@@ -87,11 +87,10 @@ mod windows {
         Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-        LoadIconW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW, TranslateMessage,
-        CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HMENU, HWND_MESSAGE,
-        IDI_APPLICATION, MSG, WM_APP, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-        WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, LoadIconW,
+        PostQuitMessage, RegisterClassW, SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW,
+        CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HMENU, HWND_MESSAGE, IDI_APPLICATION,
+        MSG, WM_APP, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WNDCLASSW,
     };
 
     const WM_TRAYICON: u32 = WM_APP + 1;
@@ -101,7 +100,7 @@ mod windows {
 
         unsafe {
             let hinstance = GetModuleHandleW(std::ptr::null());
-            if hinstance == 0 {
+            if hinstance.is_null() {
                 return Err(anyhow!("GetModuleHandleW failed"));
             }
 
@@ -134,7 +133,7 @@ mod windows {
                 exe_ptr,
             );
 
-            if hwnd == 0 {
+            if hwnd.is_null() {
                 let _ = Box::from_raw(exe_ptr as *mut std::path::PathBuf);
                 return Err(anyhow!("CreateWindowExW failed"));
             }
@@ -145,7 +144,7 @@ mod windows {
             nid.uID = 1;
             nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
             nid.uCallbackMessage = WM_TRAYICON;
-            nid.hIcon = LoadIconW(0, IDI_APPLICATION as *const u16);
+            nid.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION as *const u16);
             set_tip(&mut nid, "RustPlayer");
 
             if Shell_NotifyIconW(NIM_ADD, &mut nid) == 0 {

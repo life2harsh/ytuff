@@ -1316,15 +1316,6 @@ pub fn start_audio_thread(
                 if let Some(current_id) = current_track_id.clone() {
                     if last_finished_track_id.as_deref() != Some(current_id.as_str()) {
                         if repeat_mode == RepeatMode::One {
-                            if restart_sink_in_place(
-                                &sink,
-                                &mut elapsed_before_pause,
-                                &mut playback_start,
-                                &mut is_paused,
-                            ) {
-                                last_finished_track_id = None;
-                                continue;
-                            }
                             last_finished_track_id = Some(current_id.clone());
                             tx_clone.send(PlaybackCommand::PlayTrack(current_id)).ok();
                             continue;
