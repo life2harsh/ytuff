@@ -1173,6 +1173,8 @@ pub fn start_audio_thread(
 
         let fft_processor = Arc::new(Mutex::new(FftProcessor::new(2048)));
         let visualizer_enabled = Arc::new(Mutex::new(false));
+
+        let discord_rpc = crate::discord_rpc::init();
         let mut media_session = match MediaSession::new(tx_clone.clone()) {
             Ok(session) => session,
             Err(err) => {
@@ -1456,6 +1458,12 @@ pub fn start_audio_thread(
                                     playback_start = Some(Instant::now());
                                     maybe_seed_autoplay_queue(&core, &sc_client, &track, autoplay);
                                     prefetch_next_remote_track(&core, &sc_client);
+
+                                    if let Ok(mut rpc) = discord_rpc.lock() {
+                                        if let Some(rpc) = rpc.as_mut() {
+                                            rpc.update(&track.title, track.artist.as_deref());
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     last_finished_track_id = None;
@@ -1614,6 +1622,11 @@ pub fn start_audio_thread(
                         current_duration = 0;
                         last_finished_track_id = None;
                         active_collection = None;
+                        if let Ok(mut rpc) = discord_rpc.lock() {
+                            if let Some(rpc) = rpc.as_mut() {
+                                rpc.clear();
+                            }
+                        }
                         if shuffle_enabled {
                             shuffle_enabled = false;
                             shuffle_tx.send(false).ok();

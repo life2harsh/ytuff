@@ -19,8 +19,7 @@ pub fn start_daemon_playback_proxy(core: Core, daemon_addr: String) -> PlaybackH
     let (repeat_tx, repeat_rx): (Sender<RepeatMode>, Receiver<RepeatMode>) = mpsc::channel();
     let (shuffle_tx, shuffle_rx): (Sender<bool>, Receiver<bool>) = mpsc::channel();
     let (volume_tx, volume_rx): (Sender<f32>, Receiver<f32>) = mpsc::channel();
-    let (visualizer_tx, visualizer_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) =
-        mpsc::channel();
+    let (visualizer_tx, visualizer_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = mpsc::channel();
     let (devices_tx, devices_rx): (Sender<Vec<(String, bool)>>, Receiver<Vec<(String, bool)>>) =
         mpsc::channel();
     let (msg_tx, msg_rx): (Sender<String>, Receiver<String>) = mpsc::channel();
@@ -168,9 +167,7 @@ fn handle_command(
             Some(RpcRequest::PlayTrack { track })
         }
         PlaybackCommand::PlayCollection {
-            ids,
-            start_index,
-            ..
+            ids, start_index, ..
         } => {
             let tracks = ordered_tracks(core, &ids, start_index)?;
             Some(RpcRequest::PlayTracks { tracks })
@@ -226,7 +223,10 @@ fn ordered_tracks(core: &Core, ids: &[String], start_index: usize) -> Result<Vec
 
     ordered
         .into_iter()
-        .map(|id| core.track(&id).ok_or_else(|| anyhow!("Track not found: {id}")))
+        .map(|id| {
+            core.track(&id)
+                .ok_or_else(|| anyhow!("Track not found: {id}"))
+        })
         .collect::<Result<Vec<_>>>()
 }
 

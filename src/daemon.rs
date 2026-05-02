@@ -338,7 +338,9 @@ fn apply_request(request: RpcRequest, state: &Arc<SharedState>) -> Result<String
             Ok("devices".to_string())
         }
         RpcRequest::SwitchDevice { name } => {
-            state.pb_tx.send(PlaybackCommand::SwitchDevice(name.clone()))?;
+            state
+                .pb_tx
+                .send(PlaybackCommand::SwitchDevice(name.clone()))?;
             Ok(format!("device {name}"))
         }
         RpcRequest::ClearQueue => {
@@ -423,27 +425,25 @@ fn start_playback_state_monitor(
     volume_rx: Receiver<f32>,
     devices_rx: Receiver<Vec<(String, bool)>>,
 ) {
-    thread::spawn(move || {
-        loop {
-            if state.shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-
-            while let Ok(mode) = repeat_rx.try_recv() {
-                *state.repeat_mode.lock().unwrap() = mode;
-            }
-            while let Ok(on) = shuffle_rx.try_recv() {
-                *state.shuffle_on.lock().unwrap() = on;
-            }
-            while let Ok(vol) = volume_rx.try_recv() {
-                *state.volume.lock().unwrap() = vol;
-            }
-            while let Ok(devs) = devices_rx.try_recv() {
-                *state.devices.lock().unwrap() = devs;
-            }
-
-            thread::sleep(Duration::from_millis(50));
+    thread::spawn(move || loop {
+        if state.shutdown.load(Ordering::Relaxed) {
+            break;
         }
+
+        while let Ok(mode) = repeat_rx.try_recv() {
+            *state.repeat_mode.lock().unwrap() = mode;
+        }
+        while let Ok(on) = shuffle_rx.try_recv() {
+            *state.shuffle_on.lock().unwrap() = on;
+        }
+        while let Ok(vol) = volume_rx.try_recv() {
+            *state.volume.lock().unwrap() = vol;
+        }
+        while let Ok(devs) = devices_rx.try_recv() {
+            *state.devices.lock().unwrap() = devs;
+        }
+
+        thread::sleep(Duration::from_millis(50));
     });
 }
 

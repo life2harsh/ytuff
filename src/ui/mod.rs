@@ -1238,7 +1238,7 @@ pub fn run_ui(
                         }
                         KeyCode::Char('D') => app.download_selected(),
                         KeyCode::Char(' ') => {
-                            let _ = app.pb.tx.send(PlaybackCommand::Pause);
+                            let _ = app.pb.tx.send(PlaybackCommand::TogglePause);
                         }
                         KeyCode::Char('r') => {
                             let _ = app.pb.tx.send(PlaybackCommand::Resume);

@@ -3,6 +3,7 @@ mod attach;
 mod auth;
 mod core;
 mod daemon;
+mod discord_rpc;
 mod downloads;
 mod lyrics;
 mod media_controls;
