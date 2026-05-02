@@ -1,6 +1,8 @@
 ; NSIS installer script for RustPlayer (Windows)
 ; Requires NSIS: https://nsis.sourceforge.io/
+; Includes wimg for image rendering on Windows
 
+Name "RustPlayer"
 OutFile "rustplayer-setup.exe"
 InstallDir "$PROGRAMFILES64\RustPlayer"
 RequestExecutionLevel admin
@@ -20,7 +22,17 @@ RequestExecutionLevel admin
 Section "RustPlayer" SecMain
     SetOutPath "$INSTDIR"
     
+    ; Main executable
     File "target\release\rustplayer.exe"
+    
+    ; wimg for image rendering (Windows needs this since no sixel support)
+    IfFileExists ".tmp_wimg\wimg\build_wimg\wimg.exe" +2 0
+    MessageBox MB_OK "WARNING: wimg.exe not found. Images will not render."
+    IfFileExists ".tmp_wimg\wimg\build_wimg\wimg.exe" +1 +4
+    File ".tmp_wimg\wimg\build_wimg\wimg.exe"
+    File ".tmp_wimg\wimg\build_wimg\*.dll"
+    
+    ; Documentation
     File "README.md"
     File "LICENSE"
     
@@ -32,6 +44,9 @@ Section "RustPlayer" SecMain
     CreateShortcut "$SMPROGRAMS\RustPlayer\RustPlayer.lnk" "$INSTDIR\rustplayer.exe"
     CreateShortcut "$SMPROGRAMS\RustPlayer\Uninstall.lnk" "$INSTDIR\uninstall.exe"
     
+    ; Set PATH environment variable (so wimg.exe is accessible)
+    EnVar::AddValue "PATH" "$INSTDIR"
+    
     ; Add to Add/Remove Programs
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RustPlayer" \
                      "DisplayName" "RustPlayer"
@@ -39,18 +54,34 @@ Section "RustPlayer" SecMain
                      "UninstallString" "$INSTDIR\uninstall.exe"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RustPlayer" \
                      "InstallLocation" "$INSTDIR"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RustPlayer" \
+                     "Publisher" "RustPlayer Team"
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RustPlayer" \
+                     "NoModify" 1
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RustPlayer" \
+                     "NoRepair" 1
 SectionEnd
 
 Section "Uninstall"
+    ; Remove PATH
+    EnVar::DeleteValue "PATH" "$INSTDIR"
+    
+    ; Remove files
     Delete "$INSTDIR\rustplayer.exe"
+    Delete "$INSTDIR\wimg.exe"
+    Delete "$INSTDIR\*.dll"
     Delete "$INSTDIR\README.md"
     Delete "$INSTDIR\LICENSE"
     Delete "$INSTDIR\uninstall.exe"
     RMDir "$INSTDIR"
     
+    ; Remove shortcuts
     Delete "$SMPROGRAMS\RustPlayer\RustPlayer.lnk"
     Delete "$SMPROGRAMS\RustPlayer\Uninstall.lnk"
     RMDir "$SMPROGRAMS\RustPlayer"
     
+    ; Remove registry keys
     DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RustPlayer"
 SectionEnd
+
+; EnVar plugin required: https://nsis.sourceforge.io/EnVar_plug-in
