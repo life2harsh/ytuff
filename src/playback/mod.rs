@@ -10,10 +10,11 @@ use rustfft::{algorithm::Radix4, Fft, FftDirection};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek};
+use std::io::{BufReader, Cursor, ErrorKind, Read, Seek};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -34,6 +35,11 @@ const AUTOPLAY_REFILL_THRESHOLD: usize = 4;
 
 const FFMPEG_CHANNELS: u16 = 2;
 const FFMPEG_SAMPLE_RATE: u32 = 48_000;
+
+const FFMPEG_START_TIMEOUT: Duration = Duration::from_secs(10);
+const FFMPEG_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
+const FFMPEG_RECV_TIMEOUT: Duration = Duration::from_millis(100);
+const FFMPEG_BUFFER_CHUNKS: usize = 32;
 
 #[allow(dead_code)]
 pub enum PlaybackCommand {
@@ -1084,8 +1090,11 @@ impl MediaSource for VecMediaSource {
 
 struct FfmpegPcmSource {
     child: Child,
-    stdout: ChildStdout,
+    sample_rx: mpsc::Receiver<Vec<f32>>,
+    current_chunk: VecDeque<f32>,
     prebuffer: VecDeque<f32>,
+    reader_done: Arc<AtomicBool>,
+    idle_since: Option<Instant>,
     duration: Option<Duration>,
 }
 
@@ -1096,19 +1105,8 @@ impl FfmpegPcmSource {
         duration_secs: u64,
         start_at_secs: u64,
     ) -> anyhow::Result<Self> {
-        let mut cmd = Command::new(find_ffmpeg());
-        fn find_ffmpeg() -> String {
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(dir) = exe.parent() {
-                    let local = dir.join("ffmpeg.exe");
-                    if local.exists() {
-                        return local.to_string_lossy().to_string();
-                    }
-                }
-            }
+        let mut cmd = Command::new("ffmpeg");
 
-            "ffmpeg".to_string()
-        }
         cmd.arg("-nostdin")
             .arg("-loglevel")
             .arg("error")
@@ -1155,32 +1153,90 @@ impl FfmpegPcmSource {
             anyhow::anyhow!("Could not launch ffmpeg for streaming playback: {err}")
         })?;
 
-        let stdout = child
+        let mut stdout = child
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("ffmpeg stdout pipe was not available"))?;
 
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<f32>>(FFMPEG_BUFFER_CHUNKS);
+        let reader_done = Arc::new(AtomicBool::new(false));
+        let reader_done_bg = Arc::clone(&reader_done);
+
+        thread::spawn(move || {
+            let mut pending = Vec::<u8>::new();
+            let mut buf = [0u8; 16 * 1024];
+
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        pending.extend_from_slice(&buf[..n]);
+
+                        let usable = pending.len() - (pending.len() % 4);
+                        if usable == 0 {
+                            continue;
+                        }
+
+                        let mut samples = Vec::with_capacity(usable / 4);
+                        for chunk in pending[..usable].chunks_exact(4) {
+                            samples
+                                .push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                        }
+
+                        pending.drain(..usable);
+
+                        if !samples.is_empty() && sample_tx.send(samples).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+
+            reader_done_bg.store(true, Ordering::Relaxed);
+        });
+
+        let first_chunk = match sample_rx.recv_timeout(FFMPEG_START_TIMEOUT) {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!(
+                    "ffmpeg started, but did not produce audio within {} seconds. The stream URL may have expired, stalled, or been rejected.",
+                    FFMPEG_START_TIMEOUT.as_secs()
+                ));
+            }
+        };
+
         let mut source = Self {
             child,
-            stdout,
-            prebuffer: VecDeque::new(),
+            sample_rx,
+            current_chunk: VecDeque::new(),
+            prebuffer: first_chunk.into(),
+            reader_done,
+            idle_since: None,
             duration: (duration_secs > 0).then(|| Duration::from_secs(duration_secs)),
         };
 
-        let first_sample = Self::read_stdout_sample(&mut source.stdout).ok_or_else(|| {
-            anyhow::anyhow!(
-                "ffmpeg started, but did not produce audio. The stream URL may have expired or been rejected."
-            )
-        })?;
+        if source.prebuffer.is_empty() {
+            let _ = source.child.kill();
+            let _ = source.child.wait();
+            return Err(anyhow::anyhow!("ffmpeg produced an empty audio buffer"));
+        }
 
-        source.prebuffer.push_back(first_sample);
         Ok(source)
     }
 
-    fn read_stdout_sample(stdout: &mut ChildStdout) -> Option<f32> {
-        let mut bytes = [0u8; 4];
-        stdout.read_exact(&mut bytes).ok()?;
-        Some(f32::from_le_bytes(bytes))
+    fn terminate_child(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    fn pop_buffered_sample(&mut self) -> Option<f32> {
+        self.prebuffer
+            .pop_front()
+            .or_else(|| self.current_chunk.pop_front())
     }
 }
 
@@ -1188,11 +1244,38 @@ impl Iterator for FfmpegPcmSource {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(sample) = self.prebuffer.pop_front() {
+        if let Some(sample) = self.pop_buffered_sample() {
+            self.idle_since = None;
             return Some(sample);
         }
 
-        Self::read_stdout_sample(&mut self.stdout)
+        match self.sample_rx.recv_timeout(FFMPEG_RECV_TIMEOUT) {
+            Ok(chunk) => {
+                self.current_chunk = chunk.into();
+                self.idle_since = None;
+                self.current_chunk.pop_front()
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if self.reader_done.load(Ordering::Relaxed) {
+                    return None;
+                }
+
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return None,
+                    Err(_) => return None,
+                    Ok(None) => {}
+                }
+
+                let idle_since = self.idle_since.get_or_insert_with(Instant::now);
+                if idle_since.elapsed() >= FFMPEG_IDLE_TIMEOUT {
+                    self.terminate_child();
+                    return None;
+                }
+
+                Some(0.0)
+            }
+        }
     }
 }
 
@@ -1216,8 +1299,7 @@ impl Source for FfmpegPcmSource {
 
 impl Drop for FfmpegPcmSource {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.terminate_child();
     }
 }
 
@@ -2172,20 +2254,73 @@ pub fn start_audio_thread(
                         }
                     }
                     PlaybackCommand::Resume => {
+                        if !is_paused {
+                            continue;
+                        }
+
+                        let resume_pos = elapsed_before_pause;
+
+                        let current_track = current_track_id.as_ref().and_then(|id| core.track(id));
+
+                        if let Some(track) = current_track.as_ref().filter(|track| track.is_sc()) {
+                            let Some(handle) = stream_handle.as_ref() else {
+                                msg_tx
+                                    .send(
+                                        "No audio output available; waiting for another device"
+                                            .to_string(),
+                                    )
+                                    .ok();
+                                continue;
+                            };
+
+                            sink = None;
+                            msg_tx
+                                .send("Refreshing YouTube audio stream...".to_string())
+                                .ok();
+
+                            preparing_track_id = Some(track.id.clone());
+
+                            let tx = tx_clone.clone();
+                            let sc_client = Arc::clone(&sc_client);
+                            let handle = handle.clone();
+                            let fft_processor = fft_processor.clone();
+                            let visualizer_tx = visualizer_tx.clone();
+                            let visualizer_enabled = visualizer_enabled.clone();
+                            let track_clone = track.clone();
+
+                            thread::spawn(move || {
+                                let res = prepare_track_sink_at(
+                                    &handle,
+                                    &track_clone,
+                                    &sc_client,
+                                    fft_processor,
+                                    visualizer_tx,
+                                    visualizer_enabled,
+                                    volume,
+                                    resume_pos,
+                                )
+                                .map_err(|e| e.to_string());
+
+                                let _ = tx.send(PlaybackCommand::Prepared(
+                                    res,
+                                    track_clone.id,
+                                    resume_pos,
+                                ));
+                            });
+
+                            continue;
+                        }
+
                         if let Some(ref s) = sink {
-                            if is_paused {
-                                is_paused = false;
-                                playback_start = Some(Instant::now());
-                                s.play();
-                            }
+                            is_paused = false;
+                            playback_start = Some(Instant::now());
+                            s.play();
                         }
                     }
                     PlaybackCommand::TogglePause => {
                         if let Some(ref s) = sink {
                             if is_paused {
-                                is_paused = false;
-                                playback_start = Some(Instant::now());
-                                s.play();
+                                tx_clone.send(PlaybackCommand::Resume).ok();
                             } else {
                                 elapsed_before_pause = current_pos;
                                 is_paused = true;

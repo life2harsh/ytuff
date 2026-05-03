@@ -1,0 +1,99 @@
+--- a/src/playback/mod.rs
++++ b/src/playback/mod.rs
+@@ -1743,6 +1743,12 @@
+ 
+         thread::spawn(move || {
+             if fill_autoplay_queue(&core, &sc_client, &seed) {
+                 prefetch_next_remote_track(&core, &sc_client);
+             }
+         });
++
++        // Watchdog thread to detect hangs
++        let watchdog_tx = tx.clone();
++        thread::spawn(move || {
++            thread::sleep(Duration::from_secs(300));
++            let _ = watchdog_tx.send(PlaybackCommand::CheckHealth);
++        });
+     }
+ 
+     pub fn start_audio_thread(
+@@ -1834,6 +1840,18 @@
+         if needs_output_recovery {
+             let previous_device_name = current_device_name.clone();
+             let saved_track_id = current_track_id.clone();
+             let saved_file_path = current_file_path.clone();
+             let saved_position = current_pos;
+             let was_playing = !is_paused
+                 && (sink.is_some()
+                     || saved_track_id.is_some()
+                     || saved_file_path.is_some());
+ 
++            // Run recovery in separate thread with timeout
++            let recovery_tx = tx_clone.clone();
++            let recovery_host = host;
++            let recovery_core = core.clone();
++            let recovery_sc_client = sc_client.clone();
++            thread::spawn(move || {
++                let result = std::panic::catch_unwind(|| {
++                    rebuild_output_stream(
++                        &recovery_host,
++                        None,
++                        true,
++                        &recovery_core,
++                        &recovery_sc_client,
++                        &saved_track_id,
++                        &saved_file_path,
++                        saved_position,
++                        was_playing,
++                        fft_processor.clone(),
++                        visualizer_tx.clone(),
++                        visualizer_enabled.clone(),
++                        volume,
++                    )
++                });
++                match result {
++                    Ok(Ok(recovered)) => {
++                        let _ = recovery_tx.send(PlaybackCommand::OutputRecovered(Ok(recovered)));
++                    }
++                    Ok(Err(e)) => {
++                        let _ = recovery_tx.send(PlaybackCommand::OutputRecovered(Err(e)));
++                    }
++                    Err(_) => {
++                        let _ = recovery_tx.send(PlaybackCommand::OutputRecovered(Err(anyhow::anyhow!("Panic during recovery"))));
++                    }
++                }
++            });
++
+             sink = None;
+             _stream = None;
+             stream_handle = None;
+             current_device_name = None;
+@@ -1943,6 +1961,7 @@
+             }
+ 
+             if let Ok(cmd) = rx.recv_timeout(Duration::from_millis(50)) {
+                 match cmd {
++                    PlaybackCommand::OutputRecovered(result) => {
++                        match result {
++                            Ok(recovered) => {
++                                _stream = Some(recovered.stream);
++                                stream_handle = Some(recovered.handle);
++                                current_device_name = Some(recovered.device_name.clone());
++                                sink = recovered.sink;
++                                if sink.is_some() {
++                                    current_duration = recovered.duration;
++                                    is_paused = !was_playing;
++                                    playback_start = Some(Instant::now());
++                                }
++                                waiting_for_output_recovery = false;
++                                msg_tx.send(format!("Audio output recovered: {}", recovered.device_name)).ok();
++                            }
++                            Err(e) => {
++                                msg_tx.send(format!("Audio recovery failed: {}", e)).ok();
++                            }
++                        }
++                    }
++                    PlaybackCommand::CheckHealth => {
++                        msg_tx.send("Watchdog: Checking system health...".to_string()).ok();
++                    }
+                     PlaybackCommand::PlayIndex(idx) => {
