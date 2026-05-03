@@ -80,7 +80,11 @@ impl Clone for PlaybackCommand {
             Self::PlayIndex(i) => Self::PlayIndex(*i),
             Self::PlayNow(s) => Self::PlayNow(s.clone()),
             Self::PlayTrack(s) => Self::PlayTrack(s.clone()),
-            Self::PlayCollection { ids, start_index, kind } => Self::PlayCollection {
+            Self::PlayCollection {
+                ids,
+                start_index,
+                kind,
+            } => Self::PlayCollection {
                 ids: ids.clone(),
                 start_index: *start_index,
                 kind: *kind,
@@ -121,7 +125,12 @@ impl std::fmt::Debug for PlaybackCommand {
             Self::PlayIndex(i) => f.debug_tuple("PlayIndex").field(i).finish(),
             Self::PlayNow(s) => f.debug_tuple("PlayNow").field(s).finish(),
             Self::PlayTrack(s) => f.debug_tuple("PlayTrack").field(s).finish(),
-            Self::PlayCollection { ids, start_index, kind } => f.debug_struct("PlayCollection")
+            Self::PlayCollection {
+                ids,
+                start_index,
+                kind,
+            } => f
+                .debug_struct("PlayCollection")
                 .field("ids_len", &ids.len())
                 .field("start_index", start_index)
                 .field("kind", kind)
@@ -152,8 +161,13 @@ impl std::fmt::Debug for PlaybackCommand {
             Self::SetAutoplay(v) => f.debug_tuple("SetAutoplay").field(v).finish(),
             Self::ListDevices => write!(f, "ListDevices"),
             Self::SwitchDevice(s) => f.debug_tuple("SwitchDevice").field(s).finish(),
-            Self::Prepared(res, id, offset) => f.debug_tuple("Prepared")
-                .field(&res.as_ref().map(|(_, d)| format!("Ok(Sink, {d})")).map_err(|e| e.clone()))
+            Self::Prepared(res, id, offset) => f
+                .debug_tuple("Prepared")
+                .field(
+                    &res.as_ref()
+                        .map(|(_, d)| format!("Ok(Sink, {d})"))
+                        .map_err(|e| e.clone()),
+                )
                 .field(id)
                 .field(offset)
                 .finish(),
@@ -589,17 +603,39 @@ fn sink_from_local_file(
     volume: f32,
 ) -> anyhow::Result<(Sink, u64)> {
     let file = File::open(path)?;
-    sink_from_reader(
+
+    let rodio_result = sink_from_reader(
         handle,
         file,
         path,
-        fft_processor,
-        visualizer_tx,
-        visualizer_enabled,
+        fft_processor.clone(),
+        visualizer_tx.clone(),
+        visualizer_enabled.clone(),
         volume,
-    )
-}
+    );
 
+    match rodio_result {
+        Ok(ok) => Ok(ok),
+        Err(rodio_err) => sink_from_ffmpeg_stream(
+            handle,
+            path,
+            Vec::new(),
+            0,
+            0,
+            fft_processor,
+            visualizer_tx,
+            visualizer_enabled,
+            volume,
+        )
+        .map_err(|ffmpeg_err| {
+            anyhow::anyhow!(
+                "Could not decode local file with rodio ({}) or ffmpeg ({})",
+                rodio_err,
+                ffmpeg_err
+            )
+        }),
+    }
+}
 #[allow(dead_code)]
 fn sink_from_remote_track(
     handle: &OutputStreamHandle,
@@ -953,8 +989,19 @@ impl FfmpegPcmSource {
         duration_secs: u64,
         start_at_secs: u64,
     ) -> anyhow::Result<Self> {
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = Command::new(find_ffmpeg());
+        fn find_ffmpeg() -> String {
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    let local = dir.join("ffmpeg.exe");
+                    if local.exists() {
+                        return local.to_string_lossy().to_string();
+                    }
+                }
+            }
 
+            "ffmpeg".to_string()
+        }
         cmd.arg("-nostdin")
             .arg("-loglevel")
             .arg("error")
@@ -2153,7 +2200,11 @@ pub fn start_audio_thread(
                                     new_pos,
                                 )
                                 .map_err(|e| e.to_string());
-                                let _ = tx.send(PlaybackCommand::Prepared(res, track_clone.id, new_pos));
+                                let _ = tx.send(PlaybackCommand::Prepared(
+                                    res,
+                                    track_clone.id,
+                                    new_pos,
+                                ));
                             });
                         } else {
                             if let Err(err) = seek_current_sink(
@@ -2378,8 +2429,12 @@ pub fn start_audio_thread(
                                     is_paused = false;
                                     elapsed_before_pause = offset;
                                     playback_start = Some(Instant::now());
-                                    if let Some(track) = core.track(current_track_id.as_ref().unwrap()) {
-                                        maybe_seed_autoplay_queue(&core, &sc_client, &track, autoplay);
+                                    if let Some(track) =
+                                        core.track(current_track_id.as_ref().unwrap())
+                                    {
+                                        maybe_seed_autoplay_queue(
+                                            &core, &sc_client, &track, autoplay,
+                                        );
                                         prefetch_next_remote_track(&core, &sc_client);
                                     }
                                 }
