@@ -603,6 +603,19 @@ fn sink_from_local_file(
     volume: f32,
 ) -> anyhow::Result<(Sink, u64)> {
     let file = File::open(path)?;
+    let sym = symhonia_decode_from_file(&file, path)?;
+    if let Some((channels, sample_rate, samples, duration)) = sym {
+        let source = SamplesBuffer::new(channels, sample_rate, samples);
+        return sink_from_source(
+            handle,
+            source,
+            duration,
+            fft_processor,
+            visualizer_tx,
+            visualizer_enabled,
+            volume,
+        );
+    }
 
     let rodio_result = sink_from_reader(
         handle,
@@ -636,6 +649,100 @@ fn sink_from_local_file(
         }),
     }
 }
+
+fn symhonia_decode_from_file(
+    file: &File,
+    path: &str,
+) -> anyhow::Result<Option<(u16, u32, Vec<f32>, u64)>> {
+    let path = std::path::Path::new(path);
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !["m4a", "mp3", "flac", "ogg", "wav", "aac", "opus", "wma"].contains(&ext.as_str()) {
+        return Ok(None);
+    }
+
+    let mut hint = Hint::new();
+    hint.with_extension(&ext);
+
+    let mss = MediaSourceStream::new(Box::new(file.try_clone()?), Default::default());
+    let format_opts = FormatOptions {
+        enable_gapless: true,
+        ..Default::default()
+    };
+    let metadata_opts: MetadataOptions = Default::default();
+
+    let probed = match get_probe().format(&hint, mss, &format_opts, &metadata_opts) {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+
+    let mut format = probed.format;
+    let track = match format.default_track() {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    let track_id = track.id;
+    let mut decoder = match get_codecs().make(&track.codec_params, &DecoderOptions::default()) {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+
+    let mut channels = None;
+    let mut sample_rate = None;
+    let mut samples = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(SymphoniaError::IoError(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(_) => return Ok(None),
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        let decoded = match decoder.decode(&packet) {
+            Ok(audio_buf) => audio_buf,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(_) => return Ok(None),
+        };
+
+        let spec = *decoded.spec();
+        channels.get_or_insert(spec.channels.count() as u16);
+        sample_rate.get_or_insert(spec.rate);
+
+        let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        buf.copy_interleaved_ref(decoded);
+        samples.extend_from_slice(buf.samples());
+    }
+
+    let channels = match channels {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let sample_rate = match sample_rate {
+        Some(sr) => sr,
+        None => return Ok(None),
+    };
+
+    let duration = if channels == 0 || sample_rate == 0 {
+        0
+    } else {
+        samples.len() as u64 / channels as u64 / sample_rate as u64
+    };
+
+    Ok(Some((channels, sample_rate, samples, duration)))
+}
+
 #[allow(dead_code)]
 fn sink_from_remote_track(
     handle: &OutputStreamHandle,
@@ -2254,6 +2361,18 @@ pub fn start_audio_thread(
                         if let Some(next_id) = next_id {
                             last_finished_track_id = None;
                             tx_clone.send(PlaybackCommand::PlayTrack(next_id)).ok();
+                        } else {
+                            sink = None;
+                            current_track_id = None;
+                            current_file_path = None;
+                            core.set_cur(None);
+                            last_finished_track_id = None;
+                            is_paused = false;
+                            elapsed_before_pause = 0;
+                            playback_start = None;
+                            msg_tx
+                                .send("playback stopped (no next track)".to_string())
+                                .ok();
                         }
                     }
                     PlaybackCommand::Prev => {
@@ -2422,7 +2541,10 @@ pub fn start_audio_thread(
                                     last_finished_track_id = None;
                                     current_duration = duration;
                                     current_track_id = Some(id.clone());
-                                    current_file_path = None;
+                                    current_file_path = core
+                                        .track(&id)
+                                        .and_then(|t| t.path.clone())
+                                        .map(|p| p.to_string_lossy().to_string());
                                     core.set_cur(Some(id.clone()));
                                     core.add_hist(id);
                                     sink = Some(new_sink);
