@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -31,8 +32,10 @@ const AUTOPLAY_FETCH_LIMIT: usize = 24;
 const AUTOPLAY_TARGET_QUEUE_LEN: usize = 12;
 const AUTOPLAY_REFILL_THRESHOLD: usize = 4;
 
+const FFMPEG_CHANNELS: u16 = 2;
+const FFMPEG_SAMPLE_RATE: u32 = 48_000;
+
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
 pub enum PlaybackCommand {
     PlayIndex(usize),
     PlayNow(String),
@@ -68,6 +71,94 @@ pub enum PlaybackCommand {
     SetAutoplay(bool),
     ListDevices,
     SwitchDevice(String),
+    Prepared(Result<(Sink, u64), String>, String, u64),
+}
+
+impl Clone for PlaybackCommand {
+    fn clone(&self) -> Self {
+        match self {
+            Self::PlayIndex(i) => Self::PlayIndex(*i),
+            Self::PlayNow(s) => Self::PlayNow(s.clone()),
+            Self::PlayTrack(s) => Self::PlayTrack(s.clone()),
+            Self::PlayCollection { ids, start_index, kind } => Self::PlayCollection {
+                ids: ids.clone(),
+                start_index: *start_index,
+                kind: *kind,
+            },
+            Self::PrefetchTrack(s) => Self::PrefetchTrack(s.clone()),
+            Self::PlayFile(s) => Self::PlayFile(s.clone()),
+            Self::Pause => Self::Pause,
+            Self::Resume => Self::Resume,
+            Self::Stop => Self::Stop,
+            Self::Enqueue(s) => Self::Enqueue(s.clone()),
+            Self::EnqueueMany(v) => Self::EnqueueMany(v.clone()),
+            Self::ClearQueue => Self::ClearQueue,
+            Self::TogglePause => Self::TogglePause,
+            Self::Next => Self::Next,
+            Self::Prev => Self::Prev,
+            Self::Quit => Self::Quit,
+            Self::VolumeUp => Self::VolumeUp,
+            Self::VolumeDown => Self::VolumeDown,
+            Self::ToggleMute => Self::ToggleMute,
+            Self::SetVolume(v) => Self::SetVolume(*v),
+            Self::SkipForward(v) => Self::SkipForward(*v),
+            Self::SkipBackward(v) => Self::SkipBackward(*v),
+            Self::SeekTo(v) => Self::SeekTo(*v),
+            Self::ToggleVisualizer => Self::ToggleVisualizer,
+            Self::ToggleAutoplay => Self::ToggleAutoplay,
+            Self::ToggleRepeat => Self::ToggleRepeat,
+            Self::ToggleShuffle => Self::ToggleShuffle,
+            Self::SetAutoplay(v) => Self::SetAutoplay(*v),
+            Self::ListDevices => Self::ListDevices,
+            Self::SwitchDevice(s) => Self::SwitchDevice(s.clone()),
+            Self::Prepared(_, _, _) => panic!("PlaybackCommand::Prepared cannot be cloned"),
+        }
+    }
+}
+impl std::fmt::Debug for PlaybackCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PlayIndex(i) => f.debug_tuple("PlayIndex").field(i).finish(),
+            Self::PlayNow(s) => f.debug_tuple("PlayNow").field(s).finish(),
+            Self::PlayTrack(s) => f.debug_tuple("PlayTrack").field(s).finish(),
+            Self::PlayCollection { ids, start_index, kind } => f.debug_struct("PlayCollection")
+                .field("ids_len", &ids.len())
+                .field("start_index", start_index)
+                .field("kind", kind)
+                .finish(),
+            Self::PrefetchTrack(s) => f.debug_tuple("PrefetchTrack").field(s).finish(),
+            Self::PlayFile(s) => f.debug_tuple("PlayFile").field(s).finish(),
+            Self::Pause => write!(f, "Pause"),
+            Self::Resume => write!(f, "Resume"),
+            Self::Stop => write!(f, "Stop"),
+            Self::Enqueue(s) => f.debug_tuple("Enqueue").field(s).finish(),
+            Self::EnqueueMany(v) => f.debug_tuple("EnqueueMany").field(&v.len()).finish(),
+            Self::ClearQueue => write!(f, "ClearQueue"),
+            Self::TogglePause => write!(f, "TogglePause"),
+            Self::Next => write!(f, "Next"),
+            Self::Prev => write!(f, "Prev"),
+            Self::Quit => write!(f, "Quit"),
+            Self::VolumeUp => write!(f, "VolumeUp"),
+            Self::VolumeDown => write!(f, "VolumeDown"),
+            Self::ToggleMute => write!(f, "ToggleMute"),
+            Self::SetVolume(v) => f.debug_tuple("SetVolume").field(v).finish(),
+            Self::SkipForward(v) => f.debug_tuple("SkipForward").field(v).finish(),
+            Self::SkipBackward(v) => f.debug_tuple("SkipBackward").field(v).finish(),
+            Self::SeekTo(v) => f.debug_tuple("SeekTo").field(v).finish(),
+            Self::ToggleVisualizer => write!(f, "ToggleVisualizer"),
+            Self::ToggleAutoplay => write!(f, "ToggleAutoplay"),
+            Self::ToggleRepeat => write!(f, "ToggleRepeat"),
+            Self::ToggleShuffle => write!(f, "ToggleShuffle"),
+            Self::SetAutoplay(v) => f.debug_tuple("SetAutoplay").field(v).finish(),
+            Self::ListDevices => write!(f, "ListDevices"),
+            Self::SwitchDevice(s) => f.debug_tuple("SwitchDevice").field(s).finish(),
+            Self::Prepared(res, id, offset) => f.debug_tuple("Prepared")
+                .field(&res.as_ref().map(|(_, d)| format!("Ok(Sink, {d})")).map_err(|e| e.clone()))
+                .field(id)
+                .field(offset)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +286,7 @@ impl ActiveCollection {
 
 fn collection_order_from_scope(
     scope: &[String],
-    kind: CollectionKind,
+    _kind: CollectionKind,
     shuffle: bool,
 ) -> Vec<String> {
     let Some((current, rest)) = scope.split_first() else {
@@ -204,7 +295,7 @@ fn collection_order_from_scope(
 
     let mut order = vec![current.clone()];
     let mut remaining = rest.to_vec();
-    if shuffle && kind == CollectionKind::Playlist && remaining.len() > 1 {
+    if shuffle && remaining.len() > 1 {
         remaining.shuffle(&mut rand::thread_rng());
     }
     order.extend(remaining);
@@ -219,6 +310,16 @@ fn sync_collection_queue(core: &Core, collection: &ActiveCollection, extras: &[S
     for id in extras {
         core.enqueue(id.clone());
     }
+}
+
+fn shuffle_queue(core: &Core) -> bool {
+    let mut ids = core.q_ids();
+    if ids.len() < 2 {
+        return false;
+    }
+    ids.shuffle(&mut rand::thread_rng());
+    core.set_queue(ids);
+    true
 }
 
 fn non_collection_queue_ids(core: &Core, collection: &ActiveCollection) -> Vec<String> {
@@ -499,6 +600,7 @@ fn sink_from_local_file(
     )
 }
 
+#[allow(dead_code)]
 fn sink_from_remote_track(
     handle: &OutputStreamHandle,
     track: &Track,
@@ -508,16 +610,35 @@ fn sink_from_remote_track(
     visualizer_enabled: Arc<Mutex<bool>>,
     volume: f32,
 ) -> anyhow::Result<(Sink, u64)> {
-    let fallback_duration = track.dur.unwrap_or(0);
+    sink_from_remote_track_at(
+        handle,
+        track,
+        sc_client,
+        fft_processor,
+        visualizer_tx,
+        visualizer_enabled,
+        volume,
+        0,
+    )
+}
+
+fn sink_from_remote_track_at(
+    handle: &OutputStreamHandle,
+    track: &Track,
+    sc_client: &Arc<Mutex<SoundCloudClient>>,
+    fft_processor: Arc<Mutex<FftProcessor>>,
+    visualizer_tx: Sender<Vec<f32>>,
+    visualizer_enabled: Arc<Mutex<bool>>,
+    volume: f32,
+    start_at_secs: u64,
+) -> anyhow::Result<(Sink, u64)> {
+    let mut fallback_duration = track.dur.unwrap_or(0);
     let cached = {
         let mut client = sc_client.lock().unwrap();
         client.take_cached_audio(&track.id)
     };
 
     if let Some(bytes) = cached {
-        if let Ok(mut shared) = sc_client.lock() {
-            shared.store_cached_audio(&track.id, bytes.clone());
-        }
         let (sink, duration) = if bytes.get(4..8) == Some(b"ftyp") {
             sink_from_m4a_bytes(
                 handle,
@@ -539,6 +660,10 @@ fn sink_from_remote_track(
             )?
         };
 
+        if start_at_secs > 0 {
+            let _ = sink.try_seek(Duration::from_secs(start_at_secs));
+        }
+
         return Ok((
             sink,
             if duration == 0 {
@@ -547,6 +672,45 @@ fn sink_from_remote_track(
                 duration
             },
         ));
+    }
+
+    let stream_attempt = {
+        let mut client = sc_client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("The YouTube client is unavailable"))?;
+        let stream = client.stream(track)?;
+        fallback_duration = stream.duration_secs.unwrap_or(fallback_duration);
+        let headers = client.ffmpeg_headers();
+        (stream.url, headers)
+    };
+
+    match sink_from_ffmpeg_stream(
+        handle,
+        &stream_attempt.0,
+        stream_attempt.1,
+        fallback_duration,
+        start_at_secs,
+        fft_processor.clone(),
+        visualizer_tx.clone(),
+        visualizer_enabled.clone(),
+        volume,
+    ) {
+        Ok((sink, duration)) => {
+            return Ok((
+                sink,
+                if duration == 0 {
+                    fallback_duration
+                } else {
+                    duration
+                },
+            ));
+        }
+        Err(err) => {
+            eprintln!(
+                "FFmpeg streaming failed; falling back to full download playback: {}",
+                err
+            );
+        }
     }
 
     let bytes = {
@@ -586,10 +750,6 @@ fn sink_from_remote_track(
         }
     };
 
-    if let Ok(mut shared) = sc_client.lock() {
-        shared.store_cached_audio(&track.id, bytes.clone());
-    }
-
     let (sink, duration) = if bytes.get(4..8) == Some(b"ftyp") {
         sink_from_m4a_bytes(
             handle,
@@ -610,6 +770,10 @@ fn sink_from_remote_track(
             volume,
         )?
     };
+
+    if start_at_secs > 0 {
+        let _ = sink.try_seek(Duration::from_secs(start_at_secs));
+    }
 
     Ok((
         sink,
@@ -637,20 +801,84 @@ fn prefetch_next_remote_track(core: &Core, sc_client: &Arc<Mutex<SoundCloudClien
 }
 
 fn prefetch_remote_track_bytes(sc_client: &Arc<Mutex<SoundCloudClient>>, track: Track) {
-    let mut worker = match sc_client.lock() {
-        Ok(client) => client.clone(),
-        Err(_) => return,
-    };
-    if worker.prefetch_track(&track).is_err() {
-        return;
+    if let Ok(mut client) = sc_client.lock() {
+        let _ = client.stream(&track);
     }
-    let Some(bytes) = worker.take_cached_audio(&track.id) else {
-        return;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seek_current_sink(
+    sink: &mut Option<Sink>,
+    stream_handle: Option<&OutputStreamHandle>,
+    current_track_id: &Option<String>,
+    core: &Core,
+    sc_client: &Arc<Mutex<SoundCloudClient>>,
+    fft_processor: Arc<Mutex<FftProcessor>>,
+    visualizer_tx: Sender<Vec<f32>>,
+    visualizer_enabled: Arc<Mutex<bool>>,
+    volume: f32,
+    target_secs: u64,
+    current_duration: &mut u64,
+    elapsed_before_pause: &mut u64,
+    playback_start: &mut Option<Instant>,
+    is_paused: bool,
+) -> anyhow::Result<()> {
+    let target_secs = if *current_duration > 0 {
+        target_secs.min(*current_duration)
+    } else {
+        target_secs
     };
 
-    if let Ok(mut shared) = sc_client.lock() {
-        shared.store_cached_audio(&track.id, bytes);
+    let current_track = current_track_id.as_ref().and_then(|id| core.track(id));
+
+    if let Some(track) = current_track.as_ref().filter(|track| track.is_sc()) {
+        let handle = stream_handle
+            .ok_or_else(|| anyhow::anyhow!("No audio output is available for seeking"))?;
+
+        *sink = None;
+
+        let (new_sink, duration) = prepare_track_sink_at(
+            handle,
+            track,
+            sc_client,
+            fft_processor,
+            visualizer_tx,
+            visualizer_enabled,
+            volume,
+            target_secs,
+        )?;
+
+        if is_paused {
+            new_sink.pause();
+            *playback_start = None;
+        } else {
+            new_sink.play();
+            *playback_start = Some(Instant::now());
+        }
+
+        *current_duration = duration;
+        *elapsed_before_pause = target_secs;
+        *sink = Some(new_sink);
+
+        return Ok(());
     }
+
+    let Some(active_sink) = sink.as_ref() else {
+        return Ok(());
+    };
+
+    active_sink
+        .try_seek(Duration::from_secs(target_secs))
+        .map_err(|err| anyhow::anyhow!("Seek failed: {:?}", err))?;
+
+    *elapsed_before_pause = target_secs;
+    *playback_start = if is_paused {
+        None
+    } else {
+        Some(Instant::now())
+    };
+
+    Ok(())
 }
 
 fn restart_sink_in_place(
@@ -709,6 +937,157 @@ impl MediaSource for VecMediaSource {
     fn byte_len(&self) -> Option<u64> {
         Some(self.len)
     }
+}
+
+struct FfmpegPcmSource {
+    child: Child,
+    stdout: ChildStdout,
+    prebuffer: VecDeque<f32>,
+    duration: Option<Duration>,
+}
+
+impl FfmpegPcmSource {
+    fn new(
+        url: &str,
+        headers: &[(String, String)],
+        duration_secs: u64,
+        start_at_secs: u64,
+    ) -> anyhow::Result<Self> {
+        let mut cmd = Command::new("ffmpeg");
+
+        cmd.arg("-nostdin")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-reconnect")
+            .arg("1")
+            .arg("-reconnect_streamed")
+            .arg("1")
+            .arg("-reconnect_delay_max")
+            .arg("5");
+
+        let header_arg = ffmpeg_header_arg(headers);
+        if !header_arg.trim().is_empty() {
+            cmd.arg("-headers").arg(header_arg);
+        }
+
+        if start_at_secs > 0 {
+            cmd.arg("-ss").arg(start_at_secs.to_string());
+        }
+
+        cmd.arg("-i")
+            .arg(url)
+            .arg("-vn")
+            .arg("-f")
+            .arg("f32le")
+            .arg("-acodec")
+            .arg("pcm_f32le")
+            .arg("-ac")
+            .arg(FFMPEG_CHANNELS.to_string())
+            .arg("-ar")
+            .arg(FFMPEG_SAMPLE_RATE.to_string())
+            .arg("pipe:1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = cmd.spawn().map_err(|err| {
+            anyhow::anyhow!("Could not launch ffmpeg for streaming playback: {err}")
+        })?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("ffmpeg stdout pipe was not available"))?;
+
+        let mut source = Self {
+            child,
+            stdout,
+            prebuffer: VecDeque::new(),
+            duration: (duration_secs > 0).then(|| Duration::from_secs(duration_secs)),
+        };
+
+        let first_sample = Self::read_stdout_sample(&mut source.stdout).ok_or_else(|| {
+            anyhow::anyhow!(
+                "ffmpeg started, but did not produce audio. The stream URL may have expired or been rejected."
+            )
+        })?;
+
+        source.prebuffer.push_back(first_sample);
+        Ok(source)
+    }
+
+    fn read_stdout_sample(stdout: &mut ChildStdout) -> Option<f32> {
+        let mut bytes = [0u8; 4];
+        stdout.read_exact(&mut bytes).ok()?;
+        Some(f32::from_le_bytes(bytes))
+    }
+}
+
+impl Iterator for FfmpegPcmSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(sample) = self.prebuffer.pop_front() {
+            return Some(sample);
+        }
+
+        Self::read_stdout_sample(&mut self.stdout)
+    }
+}
+
+impl Source for FfmpegPcmSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> u16 {
+        FFMPEG_CHANNELS
+    }
+
+    fn sample_rate(&self) -> u32 {
+        FFMPEG_SAMPLE_RATE
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.duration
+    }
+}
+
+impl Drop for FfmpegPcmSource {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn ffmpeg_header_arg(headers: &[(String, String)]) -> String {
+    let mut out = String::new();
+
+    for (name, value) in headers {
+        let name = name.trim();
+        if name.is_empty() || name.contains(':') {
+            continue;
+        }
+
+        let value = value.replace('\r', "").replace('\n', "");
+        if value.trim().is_empty() {
+            continue;
+        }
+
+        out.push_str(name);
+        out.push_str(": ");
+        out.push_str(&value);
+        out.push_str("\r\n");
+    }
+
+    out
 }
 
 pub(crate) fn decode_m4a_bytes(bytes: Vec<u8>) -> anyhow::Result<(u16, u32, Vec<f32>)> {
@@ -777,6 +1156,29 @@ pub(crate) fn decode_m4a_bytes(bytes: Vec<u8>) -> anyhow::Result<(u16, u32, Vec<
     Ok((channels, sample_rate, samples))
 }
 
+fn sink_from_ffmpeg_stream(
+    handle: &OutputStreamHandle,
+    url: &str,
+    headers: Vec<(String, String)>,
+    duration: u64,
+    start_at_secs: u64,
+    fft_processor: Arc<Mutex<FftProcessor>>,
+    visualizer_tx: Sender<Vec<f32>>,
+    visualizer_enabled: Arc<Mutex<bool>>,
+    volume: f32,
+) -> anyhow::Result<(Sink, u64)> {
+    let source = FfmpegPcmSource::new(url, &headers, duration, start_at_secs)?;
+    sink_from_source(
+        handle,
+        source,
+        duration,
+        fft_processor,
+        visualizer_tx,
+        visualizer_enabled,
+        volume,
+    )
+}
+
 fn sink_from_m4a_bytes(
     handle: &OutputStreamHandle,
     bytes: Vec<u8>,
@@ -811,18 +1213,50 @@ fn prepare_track_sink(
     visualizer_enabled: Arc<Mutex<bool>>,
     volume: f32,
 ) -> anyhow::Result<(Sink, u64)> {
+    prepare_track_sink_at(
+        handle,
+        track,
+        sc_client,
+        fft_processor,
+        visualizer_tx,
+        visualizer_enabled,
+        volume,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_track_sink_at(
+    handle: &OutputStreamHandle,
+    track: &Track,
+    sc_client: &Arc<Mutex<SoundCloudClient>>,
+    fft_processor: Arc<Mutex<FftProcessor>>,
+    visualizer_tx: Sender<Vec<f32>>,
+    visualizer_enabled: Arc<Mutex<bool>>,
+    volume: f32,
+    start_at_secs: u64,
+) -> anyhow::Result<(Sink, u64)> {
     if let Some(path) = track.path.as_ref() {
         let path_str = path.to_string_lossy().to_string();
-        sink_from_local_file(
+        let (sink, duration) = sink_from_local_file(
             handle,
             &path_str,
             fft_processor,
             visualizer_tx,
             visualizer_enabled,
             volume,
-        )
+        )?;
+
+        if start_at_secs > 0 {
+            sink.try_seek(Duration::from_secs(start_at_secs))
+                .map_err(|err| {
+                    anyhow::anyhow!("Seek failed after opening local file: {:?}", err)
+                })?;
+        }
+
+        Ok((sink, duration))
     } else if track.is_sc() {
-        sink_from_remote_track(
+        sink_from_remote_track_at(
             handle,
             track,
             sc_client,
@@ -830,6 +1264,7 @@ fn prepare_track_sink(
             visualizer_tx,
             visualizer_enabled,
             volume,
+            start_at_secs,
         )
     } else {
         Err(anyhow::anyhow!("Playback is not available for this track"))
@@ -937,12 +1372,14 @@ fn restore_playback_on_handle(
     visualizer_tx: Sender<Vec<f32>>,
     visualizer_enabled: Arc<Mutex<bool>>,
     volume: f32,
+    start_at_secs: u64,
 ) -> anyhow::Result<Option<(Sink, u64)>> {
     if let Some(track_id) = current_track_id.as_deref() {
         let track = core
             .track(track_id)
             .ok_or_else(|| anyhow::anyhow!("The selected track is no longer available"))?;
-        return prepare_track_sink(
+
+        return prepare_track_sink_at(
             handle,
             &track,
             sc_client,
@@ -950,20 +1387,26 @@ fn restore_playback_on_handle(
             visualizer_tx,
             visualizer_enabled,
             volume,
+            start_at_secs,
         )
         .map(Some);
     }
 
     if let Some(path) = current_file_path.as_deref() {
-        return sink_from_local_file(
+        let (sink, duration) = sink_from_local_file(
             handle,
             path,
             fft_processor,
             visualizer_tx,
             visualizer_enabled,
             volume,
-        )
-        .map(Some);
+        )?;
+
+        if start_at_secs > 0 {
+            let _ = sink.try_seek(Duration::from_secs(start_at_secs));
+        }
+
+        return Ok(Some((sink, duration)));
     }
 
     Ok(None)
@@ -1020,17 +1463,9 @@ fn rebuild_output_stream(
         visualizer_tx,
         visualizer_enabled,
         volume,
+        saved_position,
     ) {
         Ok(Some((new_sink, new_duration))) => {
-            if saved_position > 0 {
-                if let Err(err) = new_sink.try_seek(Duration::from_secs(saved_position)) {
-                    restore_error = Some(format!(
-                        "Seek restore failed after switching audio output: {:?}",
-                        err
-                    ));
-                }
-            }
-
             if !was_playing {
                 new_sink.pause();
             }
@@ -1164,10 +1599,12 @@ pub fn start_audio_thread(
         let mut repeat_mode = RepeatMode::Off;
         let mut shuffle_enabled = false;
         let mut active_collection = None::<ActiveCollection>;
+        let mut queue_before_shuffle = None::<Vec<String>>;
         let mut elapsed_before_pause: u64 = 0;
         let mut playback_start: Option<Instant> = None;
         let mut is_paused = false;
         let mut last_finished_track_id: Option<String> = None;
+        let mut preparing_track_id: Option<String> = None;
         let mut waiting_for_output_recovery = stream_handle.is_none();
         let mut last_device_check = Instant::now();
 
@@ -1352,7 +1789,7 @@ pub fn start_audio_thread(
             if let Ok(cmd) = rx.recv_timeout(Duration::from_millis(50)) {
                 match cmd {
                     PlaybackCommand::PlayIndex(idx) => {
-                        let track = core.tracks.lock().unwrap().get(idx).cloned();
+                        let track = core.track_at(idx);
                         if let Some(track) = track {
                             active_collection = None;
                             if shuffle_enabled {
@@ -1373,37 +1810,29 @@ pub fn start_audio_thread(
                             if track.is_sc() {
                                 msg_tx.send("Buffering YouTube audio...".to_string()).ok();
                             }
-                            match prepare_track_sink(
-                                handle,
-                                &track,
-                                &sc_client,
-                                fft_processor.clone(),
-                                visualizer_tx.clone(),
-                                visualizer_enabled.clone(),
-                                volume,
-                            ) {
-                                Ok((new_sink, duration)) => {
-                                    last_finished_track_id = None;
-                                    current_duration = duration;
-                                    current_track_id = Some(track.id.clone());
-                                    current_file_path = None;
-                                    core.set_cur(Some(track.id.clone()));
-                                    core.add_hist(track.id.clone());
-                                    sink = Some(new_sink);
-                                    is_paused = false;
-                                    elapsed_before_pause = 0;
-                                    playback_start = Some(Instant::now());
-                                    maybe_seed_autoplay_queue(&core, &sc_client, &track, autoplay);
-                                    prefetch_next_remote_track(&core, &sc_client);
-                                }
-                                Err(e) => {
-                                    last_finished_track_id = None;
-                                    current_track_id = None;
-                                    current_file_path = None;
-                                    core.set_cur(None);
-                                    msg_tx.send(e.to_string()).ok();
-                                }
-                            }
+
+                            preparing_track_id = Some(track.id.clone());
+                            let tx = tx_clone.clone();
+                            let sc_client = Arc::clone(&sc_client);
+                            let handle = handle.clone();
+                            let fft_processor = fft_processor.clone();
+                            let visualizer_tx = visualizer_tx.clone();
+                            let visualizer_enabled = visualizer_enabled.clone();
+                            let track_clone = track.clone();
+
+                            thread::spawn(move || {
+                                let res = prepare_track_sink(
+                                    &handle,
+                                    &track_clone,
+                                    &sc_client,
+                                    fft_processor,
+                                    visualizer_tx,
+                                    visualizer_enabled,
+                                    volume,
+                                )
+                                .map_err(|e| e.to_string());
+                                let _ = tx.send(PlaybackCommand::Prepared(res, track_clone.id, 0));
+                            });
                         }
                     }
                     PlaybackCommand::PlayTrack(id) => {
@@ -1436,41 +1865,33 @@ pub fn start_audio_thread(
                             if track.is_sc() {
                                 msg_tx.send("Buffering YouTube audio...".to_string()).ok();
                             }
-                            match prepare_track_sink(
-                                handle,
-                                &track,
-                                &sc_client,
-                                fft_processor.clone(),
-                                visualizer_tx.clone(),
-                                visualizer_enabled.clone(),
-                                volume,
-                            ) {
-                                Ok((new_sink, duration)) => {
-                                    last_finished_track_id = None;
-                                    current_duration = duration;
-                                    current_track_id = Some(id.clone());
-                                    current_file_path = None;
-                                    core.set_cur(Some(id.clone()));
-                                    core.add_hist(id);
-                                    sink = Some(new_sink);
-                                    is_paused = false;
-                                    elapsed_before_pause = 0;
-                                    playback_start = Some(Instant::now());
-                                    maybe_seed_autoplay_queue(&core, &sc_client, &track, autoplay);
-                                    prefetch_next_remote_track(&core, &sc_client);
 
-                                    if let Ok(mut rpc) = discord_rpc.lock() {
-                                        if let Some(rpc) = rpc.as_mut() {
-                                            rpc.update(&track.title, track.artist.as_deref());
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    last_finished_track_id = None;
-                                    current_track_id = None;
-                                    current_file_path = None;
-                                    core.set_cur(None);
-                                    msg_tx.send(e.to_string()).ok();
+                            preparing_track_id = Some(id.clone());
+                            let tx = tx_clone.clone();
+                            let sc_client = Arc::clone(&sc_client);
+                            let handle = handle.clone();
+                            let fft_processor = fft_processor.clone();
+                            let visualizer_tx = visualizer_tx.clone();
+                            let visualizer_enabled = visualizer_enabled.clone();
+                            let track_clone = track.clone();
+
+                            thread::spawn(move || {
+                                let res = prepare_track_sink(
+                                    &handle,
+                                    &track_clone,
+                                    &sc_client,
+                                    fft_processor,
+                                    visualizer_tx,
+                                    visualizer_enabled,
+                                    volume,
+                                )
+                                .map_err(|e| e.to_string());
+                                let _ = tx.send(PlaybackCommand::Prepared(res, track_clone.id, 0));
+                            });
+
+                            if let Ok(mut rpc) = discord_rpc.lock() {
+                                if let Some(rpc) = rpc.as_mut() {
+                                    rpc.update(&track.title, track.artist.as_deref());
                                 }
                             }
                         } else {
@@ -1482,6 +1903,11 @@ pub fn start_audio_thread(
                     PlaybackCommand::PlayNow(id) => {
                         core.clear_queue();
                         active_collection = None;
+                        queue_before_shuffle = None;
+                        if shuffle_enabled {
+                            shuffle_enabled = false;
+                            shuffle_tx.send(false).ok();
+                        }
                         last_finished_track_id = None;
                         tx_clone.send(PlaybackCommand::PlayTrack(id)).ok();
                     }
@@ -1582,6 +2008,7 @@ pub fn start_audio_thread(
                         }
                     }
                     PlaybackCommand::Pause => {
+                        preparing_track_id = None;
                         if let Some(ref s) = sink {
                             if !is_paused {
                                 elapsed_before_pause = current_pos;
@@ -1613,6 +2040,7 @@ pub fn start_audio_thread(
                         }
                     }
                     PlaybackCommand::Stop => {
+                        preparing_track_id = None;
                         sink = None;
                         current_track_id = None;
                         current_file_path = None;
@@ -1642,6 +2070,11 @@ pub fn start_audio_thread(
                     }
                     PlaybackCommand::ClearQueue => {
                         core.clear_queue();
+                        queue_before_shuffle = None;
+                        if shuffle_enabled && active_collection.is_none() {
+                            shuffle_enabled = false;
+                            shuffle_tx.send(false).ok();
+                        }
                     }
                     PlaybackCommand::VolumeUp => {
                         volume = (volume + 0.1).min(1.0);
@@ -1674,40 +2107,78 @@ pub fn start_audio_thread(
                         volume_tx.send(volume).ok();
                     }
                     PlaybackCommand::SkipForward(secs) => {
-                        let new_pos = (current_pos + secs).min(current_duration);
-                        if let Some(ref s) = sink {
-                            match s.try_seek(Duration::from_secs(new_pos)) {
-                                Ok(_) => {
-                                    elapsed_before_pause = new_pos;
-                                    playback_start = Some(Instant::now());
-                                }
-                                Err(e) => eprintln!("Seek forward failed: {:?}", e),
-                            }
-                        }
+                        let target = (current_pos + secs).min(current_duration);
+                        tx_clone.send(PlaybackCommand::SeekTo(target)).ok();
                     }
                     PlaybackCommand::SeekTo(target) => {
-                        let new_pos = target.min(current_duration);
-                        if let Some(ref s) = sink {
-                            match s.try_seek(Duration::from_secs(new_pos)) {
-                                Ok(_) => {
-                                    elapsed_before_pause = new_pos;
-                                    playback_start = Some(Instant::now());
-                                }
-                                Err(e) => eprintln!("Seek failed: {:?}", e),
+                        let new_pos = if current_duration > 0 {
+                            target.min(current_duration)
+                        } else {
+                            target
+                        };
+
+                        let current_track = current_track_id.as_ref().and_then(|id| core.track(id));
+                        if let Some(track) = current_track.as_ref().filter(|track| track.is_sc()) {
+                            let Some(handle) = stream_handle.as_ref() else {
+                                msg_tx
+                                    .send(
+                                        "No audio output available; waiting for another device"
+                                            .to_string(),
+                                    )
+                                    .ok();
+                                continue;
+                            };
+
+                            sink = None;
+                            msg_tx.send("Seeking YouTube audio...".to_string()).ok();
+
+                            preparing_track_id = Some(track.id.clone());
+                            let tx = tx_clone.clone();
+                            let sc_client = Arc::clone(&sc_client);
+                            let handle = handle.clone();
+                            let fft_processor = fft_processor.clone();
+                            let visualizer_tx = visualizer_tx.clone();
+                            let visualizer_enabled = visualizer_enabled.clone();
+                            let track_clone = track.clone();
+
+                            thread::spawn(move || {
+                                let res = prepare_track_sink_at(
+                                    &handle,
+                                    &track_clone,
+                                    &sc_client,
+                                    fft_processor,
+                                    visualizer_tx,
+                                    visualizer_enabled,
+                                    volume,
+                                    new_pos,
+                                )
+                                .map_err(|e| e.to_string());
+                                let _ = tx.send(PlaybackCommand::Prepared(res, track_clone.id, new_pos));
+                            });
+                        } else {
+                            if let Err(err) = seek_current_sink(
+                                &mut sink,
+                                stream_handle.as_ref(),
+                                &current_track_id,
+                                &core,
+                                &sc_client,
+                                fft_processor.clone(),
+                                visualizer_tx.clone(),
+                                visualizer_enabled.clone(),
+                                volume,
+                                new_pos,
+                                &mut current_duration,
+                                &mut elapsed_before_pause,
+                                &mut playback_start,
+                                is_paused,
+                            ) {
+                                msg_tx.send(err.to_string()).ok();
                             }
                         }
                     }
                     PlaybackCommand::SkipBackward(secs) => {
-                        let new_pos = current_pos.saturating_sub(secs);
-                        if let Some(ref s) = sink {
-                            match s.try_seek(Duration::from_secs(new_pos)) {
-                                Ok(_) => {
-                                    elapsed_before_pause = new_pos;
-                                    playback_start = Some(Instant::now());
-                                }
-                                Err(e) => eprintln!("Seek backward failed: {:?}", e),
-                            }
-                        }
+                        let target = current_pos.saturating_sub(secs);
+                        tx_clone.send(PlaybackCommand::SeekTo(target)).ok();
                     }
                     PlaybackCommand::Next => {
                         if autoplay && core.q_ids().len() < AUTOPLAY_REFILL_THRESHOLD {
@@ -1770,32 +2241,49 @@ pub fn start_audio_thread(
                         msg_tx.send(repeat_mode.label().to_string()).ok();
                     }
                     PlaybackCommand::ToggleShuffle => {
-                        let Some(collection) = active_collection.as_mut() else {
+                        if let Some(collection) = active_collection.as_mut() {
+                            shuffle_enabled = !shuffle_enabled;
+                            queue_before_shuffle = None;
+                            let extras = non_collection_queue_ids(&core, collection);
+                            collection.rebuild_order(shuffle_enabled);
+                            sync_collection_queue(&core, collection, &extras);
+                            shuffle_tx.send(shuffle_enabled).ok();
                             msg_tx
-                                .send(
-                                    "open or start a playlist before toggling shuffle".to_string(),
-                                )
-                                .ok();
-                            continue;
-                        };
-                        if !collection.is_playlist() {
-                            msg_tx
-                                .send("shuffle only works for playlists".to_string())
+                                .send(format!(
+                                    "collection shuffle {}",
+                                    if shuffle_enabled { "on" } else { "off" }
+                                ))
                                 .ok();
                             continue;
                         }
-
-                        shuffle_enabled = !shuffle_enabled;
-                        let extras = non_collection_queue_ids(&core, collection);
-                        collection.rebuild_order(shuffle_enabled);
-                        sync_collection_queue(&core, collection, &extras);
-                        shuffle_tx.send(shuffle_enabled).ok();
-                        msg_tx
-                            .send(format!(
-                                "playlist shuffle {}",
-                                if shuffle_enabled { "on" } else { "off" }
-                            ))
-                            .ok();
+                        if autoplay {
+                            msg_tx
+                                .send("shuffle is disabled for autoplay queue".to_string())
+                                .ok();
+                            continue;
+                        }
+                        if shuffle_enabled {
+                            if let Some(original) = queue_before_shuffle.take() {
+                                core.set_queue(original);
+                            }
+                            shuffle_enabled = false;
+                            shuffle_tx.send(false).ok();
+                            msg_tx.send("queue shuffle off".to_string()).ok();
+                            continue;
+                        }
+                        let original = core.q_ids();
+                        if original.len() < 2 {
+                            msg_tx
+                                .send("queue needs at least 2 tracks to shuffle".to_string())
+                                .ok();
+                            continue;
+                        }
+                        queue_before_shuffle = Some(original);
+                        if shuffle_queue(&core) {
+                            shuffle_enabled = true;
+                            shuffle_tx.send(true).ok();
+                            msg_tx.send("queue shuffle on".to_string()).ok();
+                        }
                     }
                     PlaybackCommand::SetAutoplay(enabled) => {
                         autoplay = enabled;
@@ -1875,7 +2363,44 @@ pub fn start_audio_thread(
                             }
                         }
                     }
-                    PlaybackCommand::Quit => break,
+                    PlaybackCommand::Prepared(res, id, offset) => {
+                        if preparing_track_id.as_deref() == Some(id.as_str()) {
+                            preparing_track_id = None;
+                            match res {
+                                Ok((new_sink, duration)) => {
+                                    last_finished_track_id = None;
+                                    current_duration = duration;
+                                    current_track_id = Some(id.clone());
+                                    current_file_path = None;
+                                    core.set_cur(Some(id.clone()));
+                                    core.add_hist(id);
+                                    sink = Some(new_sink);
+                                    is_paused = false;
+                                    elapsed_before_pause = offset;
+                                    playback_start = Some(Instant::now());
+                                    if let Some(track) = core.track(current_track_id.as_ref().unwrap()) {
+                                        maybe_seed_autoplay_queue(&core, &sc_client, &track, autoplay);
+                                        prefetch_next_remote_track(&core, &sc_client);
+                                    }
+                                }
+                                Err(e) => {
+                                    last_finished_track_id = None;
+                                    current_track_id = None;
+                                    current_file_path = None;
+                                    core.set_cur(None);
+                                    msg_tx.send(e).ok();
+                                }
+                            }
+                        }
+                    }
+                    PlaybackCommand::Quit => {
+                        if let Ok(mut rpc) = discord_rpc.lock() {
+                            if let Some(rpc) = rpc.as_mut() {
+                                rpc.clear();
+                            }
+                        }
+                        break;
+                    }
                 }
             }
         }

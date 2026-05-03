@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +7,8 @@ use track::{Src, Track};
 
 #[derive(Clone, Default)]
 pub struct Core {
-    pub tracks: Arc<Mutex<Vec<Track>>>,
+    pub tracks: Arc<Mutex<HashMap<String, Track>>>,
+    pub track_order: Arc<Mutex<Vec<String>>>,
     pub q: Arc<Mutex<Vec<String>>>,
     pub cur: Arc<Mutex<Option<String>>>,
     pub hist: Arc<Mutex<Vec<String>>>,
@@ -18,7 +19,8 @@ pub struct Core {
 impl Core {
     pub fn new() -> Self {
         Self {
-            tracks: Arc::new(Mutex::new(Vec::new())),
+            tracks: Arc::new(Mutex::new(HashMap::new())),
+            track_order: Arc::new(Mutex::new(Vec::new())),
             q: Arc::new(Mutex::new(Vec::new())),
             cur: Arc::new(Mutex::new(None)),
             hist: Arc::new(Mutex::new(Vec::new())),
@@ -60,51 +62,59 @@ impl Core {
         }
         let rem = ps.remove(idx);
         drop(ps);
-
-        let mut trs = self.tracks.lock().unwrap();
-        trs.retain(|tr| match (&tr.src, &tr.path) {
-            (Src::Local, Some(p)) => !p.starts_with(&rem),
+        let mut tracks = self.tracks.lock().unwrap();
+        tracks.retain(|_, track| match (&track.src, &track.path) {
+            (Src::Local, Some(path)) => !path.starts_with(&rem),
             _ => true,
         });
-        drop(trs);
+        let keep = tracks.keys().cloned().collect::<HashSet<_>>();
+        drop(tracks);
+        self.track_order
+            .lock()
+            .unwrap()
+            .retain(|id| keep.contains(id));
         self.purge_dead();
         Ok(())
     }
 
     pub fn put_tracks(&self, list: Vec<Track>) {
-        let mut trs = self.tracks.lock().unwrap();
-        for tr in list {
-            if let Some(i) = trs.iter().position(|x| x.id == tr.id) {
-                trs[i] = tr;
-            } else {
-                trs.push(tr);
+        let mut tracks = self.tracks.lock().unwrap();
+        let mut order = self.track_order.lock().unwrap();
+        for track in list {
+            if !tracks.contains_key(&track.id) {
+                order.push(track.id.clone());
             }
+            tracks.insert(track.id.clone(), track);
         }
     }
 
     pub fn ids_local(&self) -> Vec<String> {
-        self.tracks
-            .lock()
-            .unwrap()
+        let tracks = self.tracks.lock().unwrap();
+        let order = self.track_order.lock().unwrap();
+        order
             .iter()
-            .filter(|tr| tr.src == Src::Local)
-            .map(|tr| tr.id.clone())
+            .filter_map(|id| {
+                tracks
+                    .get(id)
+                    .filter(|track| track.src == Src::Local)
+                    .map(|track| track.id.clone())
+            })
             .collect()
     }
 
     pub fn track(&self, id: &str) -> Option<Track> {
-        self.tracks
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|tr| tr.id == id)
-            .cloned()
+        self.tracks.lock().unwrap().get(id).cloned()
+    }
+
+    pub fn track_at(&self, idx: usize) -> Option<Track> {
+        let id = self.track_order.lock().unwrap().get(idx).cloned()?;
+        self.track(&id)
     }
 
     pub fn tracks_of(&self, ids: &[String]) -> Vec<Track> {
-        let map = self.tracks.lock().unwrap();
+        let tracks = self.tracks.lock().unwrap();
         ids.iter()
-            .filter_map(|id| map.iter().find(|tr| &tr.id == id).cloned())
+            .filter_map(|id| tracks.get(id).cloned())
             .collect()
     }
 
@@ -127,6 +137,10 @@ impl Core {
 
     pub fn clear_queue(&self) {
         self.q.lock().unwrap().clear();
+    }
+
+    pub fn set_queue(&self, ids: Vec<String>) {
+        *self.q.lock().unwrap() = ids;
     }
 
     pub fn add_hist(&self, id: String) {
@@ -173,13 +187,15 @@ impl Core {
             .tracks
             .lock()
             .unwrap()
-            .iter()
-            .map(|tr| tr.id.clone())
+            .keys()
+            .cloned()
             .collect::<HashSet<_>>();
-
+        self.track_order
+            .lock()
+            .unwrap()
+            .retain(|id| keep.contains(id));
         self.q.lock().unwrap().retain(|id| keep.contains(id));
         self.hist.lock().unwrap().retain(|id| keep.contains(id));
-
         let mut cur = self.cur.lock().unwrap();
         if cur.as_ref().is_some_and(|id| !keep.contains(id)) {
             *cur = None;

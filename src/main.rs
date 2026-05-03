@@ -5,6 +5,7 @@ mod core;
 mod daemon;
 mod discord_rpc;
 mod downloads;
+mod library_cache;
 mod lyrics;
 mod media_controls;
 mod playback;
@@ -336,10 +337,12 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Config) => print_json_or_text(&runtime.cfg, cli.json, || {
+            let downloads = runtime.cfg.effective_downloads_dir(&runtime.paths);
             format!(
-                "quality: {}\nscan paths: {}\nautoplay: {}\nlyrics: {}\nbackground on boot: {}",
+                "quality: {}\nscan paths: {}\ndownloads: {}\nautoplay: {}\nlyrics: {}\nbackground on boot: {}",
                 runtime.cfg.quality,
                 runtime.cfg.scan_paths.len(),
+                downloads.display(),
                 runtime.cfg.autoplay,
                 runtime.cfg.lyrics_enabled,
                 runtime.cfg.start_background_on_boot
@@ -402,11 +405,31 @@ impl Runtime {
 
     fn build_core(&self) -> Core {
         let core = Core::new();
-        for path in &self.cfg.scan_paths {
-            if let Some(path_str) = path.to_str() {
+        let downloads = self.cfg.effective_downloads_dir(&self.paths);
+        if downloads.exists() {
+            if let Some(path_str) = downloads.to_str() {
                 let _ = core.add_scan_path(path_str);
             }
         }
+        let scan_paths = self.cfg.scan_paths.clone();
+
+        match crate::library_cache::scan_paths_cached(&self.paths, &scan_paths) {
+            Ok(tracks) => {
+                core.put_tracks(tracks);
+                *core.scan_paths.lock().unwrap() = scan_paths
+                    .into_iter()
+                    .filter(|path| path.exists() && path.is_dir())
+                    .collect();
+            }
+            Err(_) => {
+                for path in &scan_paths {
+                    if let Some(path_str) = path.to_str() {
+                        let _ = core.add_scan_path(path_str);
+                    }
+                }
+            }
+        }
+
         core
     }
 
@@ -770,7 +793,8 @@ fn library_command(runtime: &mut Runtime, command: &LibraryCommand, json: bool) 
     match command {
         LibraryCommand::AddPath { path } => {
             let path = normalize_path(path)?;
-            let count = crate::sources::local::scan_dir(&path)?.len();
+            let count =
+                crate::library_cache::scan_paths_cached(&runtime.paths, &[path.clone()])?.len();
             if runtime
                 .cfg
                 .scan_paths
@@ -1163,12 +1187,21 @@ fn format_status(status: &crate::daemon::PlayerStatus) -> String {
             "paused/stopped"
         }
     ));
+    let duration = if status.duration_secs == 0 {
+        "--:--".to_string()
+    } else {
+        format!(
+            "{:02}:{:02}",
+            status.duration_secs / 60,
+            status.duration_secs % 60
+        )
+    };
+
     lines.push(format!(
-        "position: {:02}:{:02} / {:02}:{:02}",
+        "position: {:02}:{:02} / {}",
         status.position_secs / 60,
         status.position_secs % 60,
-        status.duration_secs / 60,
-        status.duration_secs % 60
+        duration
     ));
     lines.push(format!("queue: {}", status.queue.len()));
     lines.push(format!("autoplay: {}", status.autoplay));

@@ -24,7 +24,6 @@ const WEB_REMIX_CLIENT_VERSION: &str = "1.20260502.01.00";
 const SEARCH_SONGS_FILTER: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
 const VISITOR_PREFIXES: [&str; 2] = ["Cgt", "Cgs"];
 const STREAM_DOWNLOAD_CHUNK_BYTES: u64 = 1024 * 1024 * 2;
-const AUDIO_CACHE_LIMIT: usize = 8;
 const YT_DLP_TIMEOUT_SECS: u64 = 8;
 const HOME_BROWSE_ID: &str = "FEmusic_home";
 const LIBRARY_PLAYLISTS_BROWSE_ID: &str = "FEmusic_liked_playlists";
@@ -66,6 +65,7 @@ pub struct YtState {
 #[derive(Clone, Debug)]
 pub struct YtStream {
     pub url: String,
+    pub duration_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +92,7 @@ pub struct YouTubeClient {
 struct CachedStream {
     url: String,
     expires_at: u64,
+    duration_secs: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -410,6 +411,7 @@ pub type SoundCloudClient = YouTubeClient;
 pub type ScState = YtState;
 pub type ScStream = YtStream;
 
+#[allow(dead_code)]
 impl YouTubeClient {
     pub fn new(ql: Ql) -> Self {
         let http = Client::builder()
@@ -560,6 +562,24 @@ impl YouTubeClient {
         self.cookie_header.is_some()
     }
 
+    pub fn ffmpeg_headers(&self) -> Vec<(String, String)> {
+        let mut headers = vec![
+            (
+                "User-Agent".to_string(),
+                LegacyStreamPlaybackClient::AndroidVr143
+                    .user_agent()
+                    .to_string(),
+            ),
+            ("Referer".to_string(), VIDEO_REFERER.to_string()),
+        ];
+
+        if let Some(cookie) = self.cookie_header.as_ref() {
+            headers.push(("Cookie".to_string(), cookie.clone()));
+        }
+
+        headers
+    }
+
     pub fn account_feed(&mut self, home_limit: usize, playlist_limit: usize) -> Result<Vec<Track>> {
         let mut items = self.home_feed(home_limit)?;
         if self.authenticated() {
@@ -649,6 +669,7 @@ impl YouTubeClient {
             if cached.expires_at > now() + 30 {
                 return Ok(ScStream {
                     url: cached.url.clone(),
+                    duration_secs: cached.duration_secs.or(tr.dur),
                 });
             }
         }
@@ -667,8 +688,12 @@ impl YouTubeClient {
                 ))
             }) {
             Ok(cached) => {
+                let duration_secs = cached.duration_secs.or(tr.dur);
                 self.stream_cache.insert(tr.id.clone(), cached.clone());
-                Ok(ScStream { url: cached.url })
+                Ok(ScStream {
+                    url: cached.url,
+                    duration_secs,
+                })
             }
             Err(err) => Err(err),
         }
@@ -683,29 +708,6 @@ impl YouTubeClient {
     pub fn take_cached_audio(&mut self, track_id: &str) -> Option<Vec<u8>> {
         self.audio_cache_order.retain(|id| id != track_id);
         self.audio_cache.remove(track_id)
-    }
-
-    pub fn store_cached_audio(&mut self, track_id: &str, bytes: Vec<u8>) {
-        self.audio_cache_order.retain(|id| id != track_id);
-        if !self.audio_cache.contains_key(track_id) && self.audio_cache.len() >= AUDIO_CACHE_LIMIT {
-            if let Some(oldest_key) = self.audio_cache_order.first().cloned() {
-                self.audio_cache.remove(&oldest_key);
-                self.audio_cache_order.remove(0);
-            }
-        }
-        self.audio_cache.insert(track_id.to_string(), bytes);
-        self.audio_cache_order.push(track_id.to_string());
-    }
-
-    pub fn prefetch_track(&mut self, tr: &Track) -> Result<()> {
-        if !tr.is_sc() || self.audio_cache.contains_key(&tr.id) {
-            return Ok(());
-        }
-
-        let stream = self.stream(tr)?;
-        let bytes = self.download_stream(&stream.url)?;
-        self.store_cached_audio(&tr.id, bytes);
-        Ok(())
     }
 
     pub fn download_stream(&self, url: &str) -> Result<Vec<u8>> {
@@ -802,6 +804,7 @@ impl YouTubeClient {
                         return Ok(CachedStream {
                             url: choice.url,
                             expires_at: choice.expires_at,
+                            duration_secs: video_duration_secs(&json),
                         });
                     }
 
@@ -850,6 +853,7 @@ impl YouTubeClient {
         Ok(CachedStream {
             url: url.to_string(),
             expires_at: stream_expiration(url),
+            duration_secs: None,
         })
     }
 
@@ -2325,6 +2329,18 @@ fn browse_page_title(rsp: &Value) -> Option<String> {
         "/contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicResponsiveHeaderRenderer/title/runs/0/text",
     ])
     .map(|value| value.to_string())
+}
+
+fn video_duration_secs(player: &Value) -> Option<u64> {
+    player
+        .pointer("/videoDetails/lengthSeconds")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| {
+            player
+                .pointer("/videoDetails/lengthSeconds")
+                .and_then(Value::as_u64)
+        })
 }
 
 fn playability_status(player: &Value) -> Option<&str> {

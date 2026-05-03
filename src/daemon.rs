@@ -32,6 +32,7 @@ pub enum RpcRequest {
     VolumeUp,
     VolumeDown,
     ToggleMute,
+    TogglePause,
     ToggleRepeat,
     ToggleShuffle,
     ToggleVisualizer,
@@ -91,9 +92,30 @@ pub fn run_daemon(paths: AppPaths, config: AppConfig) -> Result<()> {
     let core = Core::new();
     core.set_sc(true);
 
-    for path in cfg.lock().unwrap().scan_paths.clone() {
-        if let Some(path_str) = path.to_str() {
+    let cfg_guard = cfg.lock().unwrap();
+    let downloads = cfg_guard.effective_downloads_dir(&paths);
+    if downloads.exists() {
+        if let Some(path_str) = downloads.to_str() {
             let _ = core.add_scan_path(path_str);
+        }
+    }
+    let scan_paths = cfg_guard.scan_paths.clone();
+    drop(cfg_guard);
+
+    match crate::library_cache::scan_paths_cached(&paths, &scan_paths) {
+        Ok(tracks) => {
+            core.put_tracks(tracks);
+            *core.scan_paths.lock().unwrap() = scan_paths
+                .into_iter()
+                .filter(|path| path.exists() && path.is_dir())
+                .collect();
+        }
+        Err(_) => {
+            for path in &scan_paths {
+                if let Some(path_str) = path.to_str() {
+                    let _ = core.add_scan_path(path_str);
+                }
+            }
         }
     }
 
@@ -289,6 +311,10 @@ fn apply_request(request: RpcRequest, state: &Arc<SharedState>) -> Result<String
             state.pb_tx.send(PlaybackCommand::Resume)?;
             Ok("resumed".to_string())
         }
+        RpcRequest::TogglePause => {
+            state.pb_tx.send(PlaybackCommand::TogglePause)?;
+            Ok("pause toggled".to_string())
+        }
         RpcRequest::Stop => {
             state.pb_tx.send(PlaybackCommand::Stop)?;
             Ok("stopped".to_string())
@@ -386,9 +412,13 @@ fn put_track(state: &Arc<SharedState>, track: &Track) {
 }
 
 fn status_snapshot(state: &Arc<SharedState>) -> PlayerStatus {
-    let (position_secs, duration_secs, is_playing) =
+    let (position_secs, mut duration_secs, is_playing) =
         (*state.position.lock().unwrap()).unwrap_or((0, 0, false));
     let current = state.core.cur_id().and_then(|id| state.core.track(&id));
+
+    if duration_secs == 0 {
+        duration_secs = current.as_ref().and_then(|track| track.dur).unwrap_or(0);
+    }
     let queue = state.core.tracks_of(&state.core.q_ids());
     let autoplay = state.cfg.lock().unwrap().autoplay;
     let repeat_mode = *state.repeat_mode.lock().unwrap();

@@ -77,8 +77,8 @@ pub(crate) enum CollectionAction {
     Enqueue,
 }
 
-mod media;
-use media::Media;
+pub mod media;
+use self::media::{wimg_command, Media};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -2074,6 +2074,7 @@ fn draw_info_box(f: &mut Frame, app: &App, area: Rect) {
 
         if let Some((cur, tot, on)) = *app.pb.position_rx.lock().unwrap() {
             lines.push(Line::from(""));
+            let shown_total = if tot == 0 { tr.dur.unwrap_or(0) } else { tot };
             lines.push(Line::from(vec![
                 Span::styled(
                     if on { ">" } else { "||" },
@@ -2083,12 +2084,12 @@ fn draw_info_box(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    format!("{} / {}", clock(cur), clock(tot)),
+                    format!("{} / {}", clock(cur), clock_total(shown_total)),
                     Style::default().fg(Color::Rgb(229, 234, 241)),
                 ),
             ]));
             lines.push(Line::from(Span::styled(
-                bar(cur, tot, area.width.saturating_sub(4) as usize),
+                bar(cur, shown_total, area.width.saturating_sub(4) as usize),
                 Style::default().fg(Color::Rgb(255, 131, 116)),
             )));
         }
@@ -2573,7 +2574,7 @@ fn preview_bytes_with_wimg(bytes: &[u8]) -> anyhow::Result<()> {
         print!("\x1b[2J\x1b[H\x1b[?25h");
         io::stdout().flush()?;
 
-        let status = Command::new("wimg").arg(&path).status()?;
+        let status = Command::new(wimg_command()).arg(&path).status()?;
         if !status.success() {
             anyhow::bail!("wimg exited with status {}", status);
         }
@@ -2642,6 +2643,14 @@ fn playback_state_label(is_playing: bool) -> (&'static str, Color) {
 
 fn clock(secs: u64) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+fn clock_total(secs: u64) -> String {
+    if secs == 0 {
+        "--:--".to_string()
+    } else {
+        clock(secs)
+    }
 }
 
 fn trim(v: &str, n: usize) -> String {

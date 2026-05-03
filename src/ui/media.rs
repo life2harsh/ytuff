@@ -50,12 +50,28 @@ impl ArtRenderer {
     }
 
     fn auto_detect() -> Self {
-        if kitty_on() {
-            Self::Kitty
-        } else if sixel_on() && wimg_on() {
-            Self::Wimg
+        if cfg!(target_os = "windows") {
+            // Windows: wimg is primary.
+            if wimg_on() {
+                Self::Wimg
+            } else if kitty_on() {
+                Self::Kitty
+            } else if sixel_on() {
+                Self::Sixel
+            } else {
+                Self::Blocks
+            }
         } else {
-            Self::Blocks
+            // Linux and other terminals: kitty, then native sixel, then wimg, then blocks.
+            if kitty_on() {
+                Self::Kitty
+            } else if sixel_on() {
+                Self::Sixel
+            } else if wimg_on() {
+                Self::Wimg
+            } else {
+                Self::Blocks
+            }
         }
     }
 
@@ -92,17 +108,23 @@ impl Media {
         let wimg_ready = wimg_on();
         let (renderer, renderer_note) = match requested {
             ArtRenderer::Off => (ArtRenderer::Off, None),
+
             ArtRenderer::Kitty if kitty_ready => (ArtRenderer::Kitty, Some("protocol".to_string())),
             ArtRenderer::Kitty => (ArtRenderer::Blocks, Some("kitty unavailable".to_string())),
+
             ArtRenderer::Sixel if sixel_ready => (ArtRenderer::Sixel, None),
             ArtRenderer::Sixel => (ArtRenderer::Blocks, Some("sixel unavailable".to_string())),
-            ArtRenderer::Wimg if wimg_ready && sixel_ready => {
-                (ArtRenderer::Wimg, Some("renderer".to_string()))
+
+            ArtRenderer::Wimg if wimg_ready => {
+                let note = if cfg!(target_os = "windows") {
+                    "windows primary"
+                } else {
+                    "renderer"
+                };
+                (ArtRenderer::Wimg, Some(note.to_string()))
             }
-            ArtRenderer::Wimg if !wimg_ready => {
-                (ArtRenderer::Blocks, Some("wimg unavailable".to_string()))
-            }
-            ArtRenderer::Wimg => (ArtRenderer::Blocks, Some("sixel unavailable".to_string())),
+            ArtRenderer::Wimg => (ArtRenderer::Blocks, Some("wimg unavailable".to_string())),
+
             ArtRenderer::Blocks => (ArtRenderer::Blocks, None),
         };
         Self {
@@ -502,7 +524,7 @@ fn enc_wimg(img: DynamicImage, rect: Rect) -> Result<Vec<u8>> {
     let path = temp_wimg_path();
     image::DynamicImage::ImageRgb8(rgb).save(&path)?;
 
-    let output = Command::new("wimg")
+    let output = Command::new(wimg_command())
         .arg(&path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -947,8 +969,43 @@ fn normalize_graphic(buf: Vec<u8>) -> Vec<u8> {
     buf
 }
 
+pub(crate) fn wimg_command() -> std::path::PathBuf {
+    if let Ok(value) = env::var("RUSTPLAYER_WIMG") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return std::path::PathBuf::from(value);
+        }
+    }
+
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let local = dir.join(if cfg!(target_os = "windows") {
+                "wimg.exe"
+            } else {
+                "wimg"
+            });
+
+            if local.exists() {
+                return local;
+            }
+        }
+    }
+
+    std::path::PathBuf::from(if cfg!(target_os = "windows") {
+        "wimg.exe"
+    } else {
+        "wimg"
+    })
+}
+
 fn wimg_on() -> bool {
-    Command::new("wimg")
+    let cmd = wimg_command();
+    if cmd.exists() {
+        return true;
+    }
+    
+    Command::new(cmd)
+        .arg("--help")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

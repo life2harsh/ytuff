@@ -34,11 +34,23 @@ pub fn start_daemon_playback_proxy(core: Core, daemon_addr: String) -> PlaybackH
         let mut last_shuffle: Option<bool> = None;
         let mut last_volume: Option<f32> = None;
         let mut last_devices: Option<Vec<(String, bool)>> = None;
+        let mut last_track_state: Option<(Option<String>, Vec<String>)> = None;
 
         let mut next_poll = Instant::now();
 
         let mut apply_status = |status: &crate::daemon::PlayerStatus| {
-            sync_core_from_status(&core_bg, status);
+            let track_state = (
+                status.current.as_ref().map(|track| track.id.clone()),
+                status
+                    .queue
+                    .iter()
+                    .map(|track| track.id.clone())
+                    .collect::<Vec<_>>(),
+            );
+            if last_track_state.as_ref() != Some(&track_state) {
+                sync_core_from_status(&core_bg, status);
+                last_track_state = Some(track_state);
+            }
             *position_bg.lock().unwrap() = Some((
                 status.position_secs,
                 status.duration_secs,
@@ -147,6 +159,7 @@ fn handle_command(
         PlaybackCommand::Prev => Some(RpcRequest::Prev),
         PlaybackCommand::VolumeUp => Some(RpcRequest::VolumeUp),
         PlaybackCommand::VolumeDown => Some(RpcRequest::VolumeDown),
+        PlaybackCommand::TogglePause => Some(RpcRequest::TogglePause),
         PlaybackCommand::ToggleMute => Some(RpcRequest::ToggleMute),
         PlaybackCommand::ToggleRepeat => Some(RpcRequest::ToggleRepeat),
         PlaybackCommand::ToggleShuffle => Some(RpcRequest::ToggleShuffle),
@@ -231,17 +244,14 @@ fn ordered_tracks(core: &Core, ids: &[String], start_index: usize) -> Result<Vec
 }
 
 fn sync_core_from_status(core: &Core, status: &crate::daemon::PlayerStatus) {
-    core.clear_queue();
-
+    let mut tracks = Vec::with_capacity(status.queue.len() + 1);
     if let Some(track) = status.current.as_ref() {
-        core.put_tracks(vec![track.clone()]);
+        tracks.push(track.clone());
         core.set_cur(Some(track.id.clone()));
     } else {
         core.set_cur(None);
     }
-
-    for track in &status.queue {
-        core.put_tracks(vec![track.clone()]);
-        core.enqueue(track.id.clone());
-    }
+    tracks.extend(status.queue.iter().cloned());
+    core.put_tracks(tracks);
+    core.set_queue(status.queue.iter().map(|track| track.id.clone()).collect());
 }
