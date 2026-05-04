@@ -31,6 +31,8 @@ fun fact: this originally started out as a SoundCloud terminal client, almost an
 <img width="1906" height="986" alt="image" src="https://github.com/user-attachments/assets/09b3ed67-b280-472d-bda4-9262ed8f6231" />
 
 ### help section
+<img width="1276" height="802" alt="image" src="https://github.com/user-attachments/assets/858f0b6f-583c-4fd5-b4dc-59b6007ab552" />
+
 
 ```text
 RustPlayer TUI
