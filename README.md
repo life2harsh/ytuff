@@ -1,12 +1,9 @@
 # RustPlayer
 
 RustPlayer is a terminal music player for local files and YouTube Music. it has a full TUI, a background playback daemon, playlists, downloads, lyrics, artwork, media controls, and local library scanning.
-RustPlayer is a terminal music player for local files and YouTube Music. it has a full TUI, a background playback daemon, playlists, downloads, lyrics, artwork, media controls, and local library scanning.
 
 first of all, shoutout @Metrolist. they made the API part of the project pretty easy. i personally hate kotlin, but i love what they made out of it. all my best wishes and prayers to you guys. 
-first of all, shoutout @Metrolist. they made the API part of the project pretty easy. i personally hate kotlin, but i love what they made out of it. all my best wishes and prayers to you guys. 
 
-fun fact: this originally started out as a SoundCloud terminal client, almost an year ago, or atleast i started planning it at that time. because the SoundCloud API said "if your application streams or uses SoundCloud data, it has to have the powered by SoundCloud logo" . well, i can't pay 15usd a month for artist pro. i'm broke. so then, i shifted to YT and well, here we are.
 fun fact: this originally started out as a SoundCloud terminal client, almost an year ago, or atleast i started planning it at that time. because the SoundCloud API said "if your application streams or uses SoundCloud data, it has to have the powered by SoundCloud logo" . well, i can't pay 15usd a month for artist pro. i'm broke. so then, i shifted to YT and well, here we are.
 
 ## Features
@@ -274,57 +271,17 @@ List folders:
 
 ```bash
 rustplayer library list-paths
-rustplayer library list-paths
 ```
 
-Remove a folder by index:
 Remove a folder by index:
 
 ```bash
 rustplayer library remove-path 0
 ```
-```bash
-rustplayer library remove-path 0
-```
 
 You can also pass scan paths when starting the app:
-You can also pass scan paths when starting the app:
 
 ```bash
-rustplayer --path "/path/to/Music" tui
-```
-
-Supported local file extensions include:
-
-```text
-mp3, flac, wav, m4a, ogg, aac, opus, wma
-```
-
-RustPlayer uses FFmpeg as a fallback for formats that the native decoder does not handle cleanly.
-
-## YouTube Music auth
-
-Guest playback works for many tracks, but YouTube can block or limit some requests. Signing in gives RustPlayer access to personalized home, account playlists, and more reliable playback.
-
-Open the login window:
-
-```bash
-rustplayer auth login
-```
-
-Show current auth state:
-
-```bash
-rustplayer auth show
-```
-
-Import a cookie file:
-
-```bash
-rustplayer auth cookie-file cookies.txt
-```
-
-Import a raw cookie header:
 rustplayer --path "/path/to/Music" tui
 ```
 
@@ -531,183 +488,8 @@ rustplayer --json search "boards of canada" --limit 5
 ## Configuration
 
 Print the current config:
-```
-
-Import `ytmusicapi` headers:
 
 ```bash
-rustplayer auth headers-file headers.json
-```
-
-Sign out from the TUI with `L`.
-
-## Queue
-
-Add something to the queue:
-
-```bash
-rustplayer queue add "aphex twin xtal"
-```
-
-Show the queue:
-
-```bash
-rustplayer queue show
-```
-
-Clear the queue:
-
-```bash
-rustplayer queue clear
-```
-
-## Playlists
-
-Create a playlist:
-
-```bash
-rustplayer playlist create mix
-```
-
-List playlists:
-
-```bash
-rustplayer playlist list
-```
-
-Show a playlist:
-
-```bash
-rustplayer playlist show mix
-```
-
-Add a track:
-
-```bash
-rustplayer playlist add mix "https://music.youtube.com/watch?v=lYBUbBu4W08"
-```
-
-Import a YouTube playlist or album:
-
-```bash
-rustplayer playlist import "https://music.youtube.com/playlist?list=..." --name my-playlist
-```
-
-Play a playlist:
-
-```bash
-rustplayer playlist play mix
-```
-
-Queue a playlist:
-
-```bash
-rustplayer playlist enqueue mix
-```
-
-Download a playlist:
-
-```bash
-rustplayer playlist download mix --format m4a
-```
-
-## Lyrics
-
-Show lyrics for the current track:
-
-```bash
-rustplayer lyrics
-```
-
-Use cached lyrics only:
-
-```bash
-rustplayer lyrics --cached
-```
-
-Return JSON:
-
-```bash
-rustplayer lyrics --json
-```
-
-In the TUI, press `y` to open lyrics for the current track.
-
-## Downloads
-
-Download a track as M4A:
-
-```bash
-rustplayer download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format m4a
-```
-
-Download as MP3:
-
-```bash
-rustplayer download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format mp3
-```
-
-Choose an output folder:
-
-```bash
-rustplayer download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format mp3 --output "/path/to/output"
-```
-
-Windows example:
-
-```powershell
-rustplayer download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format mp3 --output "D:\Music"
-```
-
-## Autoplay and sleep timer
-
-Enable autoplay:
-
-```bash
-rustplayer autoplay on
-```
-
-Disable autoplay:
-
-```bash
-rustplayer autoplay off
-```
-
-Set a sleep timer:
-
-```bash
-rustplayer sleep 30
-```
-
-Clear the sleep timer:
-
-```bash
-rustplayer sleep --off
-```
-
-## JSON output
-
-Some commands support JSON output through the global `--json` flag.
-
-```bash
-rustplayer --json status
-```
-
-```bash
-rustplayer --json search "boards of canada" --limit 5
-```
-
-## Configuration
-
-Print the current config:
-
-```bash
-rustplayer config
-```
-
-RustPlayer stores config, playlist data, downloads, and cached lyrics in your OS app directories under `rustplayer`.
-
-Important config values include:
 rustplayer config
 ```
 
@@ -776,90 +558,8 @@ sudo pacman -Syu --needed base-devel pkgconf curl openssl alsa-lib systemd-libs 
 ```
 
 ### Ubuntu / Debian
-```text
-quality
-scan_paths
-autoplay
-lyrics_enabled
-auto_fetch_lyrics
-daemon_addr
-downloads_dir
-youtube_cookie_header
-youtube_cookie_file
-youtube_auth_user
-start_background_on_boot
-```
-
-## Build from source
-
-Install Rust first.
-
-Build:
 
 ```bash
-cargo build --release
-```
-
-Run:
-
-```bash
-cargo run --release -- tui
-```
-
-Stop a stale daemon before testing playback changes:
-
-```bash
-cargo run --release -- shutdown
-```
-
-On Windows, if the daemon does not respond:
-
-```powershell
-taskkill /IM rustplayer.exe /F
-```
-
-## Build dependencies
-
-### Windows
-
-For normal development:
-
-```powershell
-cargo build --release
-```
-
-The Windows release bundles a prebuilt `wimg.exe`, its DLLs, `ffmpeg.exe`, and `ffprobe.exe`. You do not need to rebuild `wimg` for a normal RustPlayer release.
-
-### Arch / Manjaro
-
-```bash
-sudo pacman -Syu --needed base-devel pkgconf curl openssl alsa-lib systemd-libs gtk3 webkit2gtk-4.1 ffmpeg
-```
-
-### Ubuntu / Debian
-
-```bash
-sudo apt update
-sudo apt install build-essential pkg-config curl ca-certificates libssl-dev libasound2-dev libudev-dev libgtk-3-dev libwebkit2gtk-4.1-dev ffmpeg
-```
-
-## Build a Windows release zip
-
-Run this in PowerShell from the repository root.
-
-It builds RustPlayer, creates a clean release folder, copies the bundled `wimg` runtime files, copies FFmpeg, creates PATH installer scripts, and zips the result.
-
-```powershell
-cd H:\desktop\rustplayer
-
-$source = "H:\desktop\rustplayer\target\release"
-$dist = "H:\desktop\rustplayer\dist\rustplayer-windows-x64"
-$zip = "H:\desktop\rustplayer\dist\rustplayer-windows-x64.zip"
-$ffmpegDir = "C:\Users\jhaha\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0-full_build\bin"
-
-cargo run --release -- shutdown 2>$null
-taskkill /IM rustplayer.exe /F 2>$null
-
 sudo apt update
 sudo apt install build-essential pkg-config curl ca-certificates libssl-dev libasound2-dev libudev-dev libgtk-3-dev libwebkit2gtk-4.1-dev ffmpeg
 ```
