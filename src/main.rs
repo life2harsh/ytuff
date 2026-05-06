@@ -10,6 +10,7 @@ mod lyrics;
 mod media_controls;
 mod playback;
 mod playlist;
+mod proxy;
 mod resolve;
 mod sources;
 mod tray;
@@ -46,7 +47,7 @@ use url::Url;
     name = "rustplayer",
     version,
     about = "A high-performance terminal music player with YouTube streaming",
-    after_help = "Auth note:\n  On Windows and Linux, RustPlayer can open a dedicated YouTube Music login window with\n  'rustplayer auth login'.\n  Manual cookie login is still supported through\n  'rustplayer auth cookie-file <cookies.txt>' or\n  'rustplayer auth cookie-header \"SID=...; SAPISID=...\"'.\n  You can also import ytmusicapi headers.json via\n  'rustplayer auth headers-file <headers.json>'.\n\nExamples:\n  rustplayer auth login\n  rustplayer auth show\n  rustplayer auth headers-file headers.json\n  rustplayer status\n  rustplayer play \"never gonna give you up\"\n  rustplayer download \"https://music.youtube.com/watch?v=lYBUbBu4W08\" --format mp3\n  rustplayer playlist create mix"
+    after_help = "Auth note:\n  On Windows and Linux, RustPlayer can open a dedicated YouTube Music login window with\n  'rustplayer auth login'.\n  Manual cookie login is still supported through\n  'rustplayer auth cookie-file <cookies.txt>' or\n  'rustplayer auth cookie-header \"SID=...; SAPISID=...\"'.\n  You can also import ytmusicapi headers.json via\n  'rustplayer auth headers-file <headers.json>'.\n\nProxy note:\n  Set RUSTPLAYER_PROXY to a standard proxy URL when native requests need a tunnel,\n  for example 'socks5://127.0.0.1:1080' or 'http://127.0.0.1:8080'.\n\nExamples:\n  rustplayer auth login\n  rustplayer auth show\n  rustplayer auth headers-file headers.json\n  rustplayer status\n  rustplayer play \"never gonna give you up\"\n  rustplayer like\n  rustplayer download \"https://music.youtube.com/watch?v=lYBUbBu4W08\" --format mp3\n  rustplayer playlist create mix"
 )]
 struct Cli {
     #[arg(short = 'p', long = "path", global = true, value_name = "DIR")]
@@ -73,6 +74,9 @@ enum Command {
     },
     Play {
         input: String,
+    },
+    Like {
+        input: Option<String>,
     },
     Pause,
     Resume,
@@ -277,6 +281,7 @@ fn main() -> Result<()> {
         Some(Command::Status) => show_status(&runtime, cli.json),
         Some(Command::Search { query, limit }) => search_tracks(&runtime, query, *limit, cli.json),
         Some(Command::Play { input }) => play_input(&runtime, input),
+        Some(Command::Like { input }) => like_command(&runtime, input.as_deref()),
         Some(Command::Pause) => simple_request(&runtime, &RpcRequest::Pause, "paused"),
         Some(Command::Resume) => simple_request(&runtime, &RpcRequest::Resume, "resumed"),
         Some(Command::Stop) => simple_request(&runtime, &RpcRequest::Stop, "stopped"),
@@ -600,6 +605,21 @@ fn play_input(runtime: &Runtime, input: &str) -> Result<()> {
     let track = runtime.resolve_track(input)?;
     send_daemon(runtime, &RpcRequest::PlayTrack { track })?;
     println!("playing");
+    Ok(())
+}
+
+fn like_command(runtime: &Runtime, input: Option<&str>) -> Result<()> {
+    let track = match input {
+        Some(input) => runtime.resolve_track(input)?,
+        None => current_daemon_track(runtime)?,
+    };
+    let video_id = track
+        .remote_video_id()
+        .ok_or_else(|| anyhow!("Only YouTube tracks can be liked on YouTube Music"))?;
+
+    let mut client = runtime.make_client()?;
+    client.like_song(video_id)?;
+    println!("liked '{}' on YouTube Music", track.title);
     Ok(())
 }
 

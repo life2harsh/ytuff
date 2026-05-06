@@ -1,4 +1,5 @@
 use crate::core::track::{Acc, Track};
+use crate::proxy::{append_ytdlp_proxy_args, apply_command_proxy, apply_reqwest_proxy};
 use anyhow::{anyhow, Context, Result};
 use percent_encoding::percent_decode_str;
 use reqwest::blocking::Client;
@@ -414,18 +415,22 @@ pub type ScStream = YtStream;
 #[allow(dead_code)]
 impl YouTubeClient {
     pub fn new(ql: Ql) -> Self {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent(
+        let http = apply_reqwest_proxy(
+            Client::builder()
+                .timeout(Duration::from_secs(30))
+                .user_agent(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0",
-            )
-            .build()
-            .unwrap_or_else(|_| Client::new());
-        let media_http = Client::builder()
-            .connect_timeout(Duration::from_secs(20))
-            .user_agent(LegacyStreamPlaybackClient::AndroidVr143.user_agent())
-            .build()
-            .unwrap_or_else(|_| Client::new());
+            ),
+        )
+        .build()
+        .unwrap_or_else(|_| Client::new());
+        let media_http = apply_reqwest_proxy(
+            Client::builder()
+                .connect_timeout(Duration::from_secs(20))
+                .user_agent(LegacyStreamPlaybackClient::AndroidVr143.user_agent()),
+        )
+        .build()
+        .unwrap_or_else(|_| Client::new());
 
         Self {
             http,
@@ -603,6 +608,24 @@ impl YouTubeClient {
         self.ensure_authenticated_action("library playlists")?;
         let rsp = self.browse(json!({ "browseId": LIBRARY_PLAYLISTS_BROWSE_ID }))?;
         Ok(parse_library_playlists(&rsp, limit))
+    }
+
+    pub fn like_song(&mut self, video_id: &str) -> Result<()> {
+        self.ensure_authenticated_action("like songs")?;
+        let video_id = video_id.trim();
+        if video_id.is_empty() {
+            return Err(anyhow!("Track is missing a YouTube video id"));
+        }
+
+        let _ = self.web_remix_request(
+            "like/like",
+            json!({
+                "target": {
+                    "videoId": video_id,
+                }
+            }),
+        )?;
+        Ok(())
     }
 
     pub fn browse_page(&mut self, browse_id: &str, limit: usize) -> Result<(String, Vec<Track>)> {
@@ -881,6 +904,7 @@ impl YouTubeClient {
             common_args.push(cookie_file.display().to_string());
         }
 
+        append_ytdlp_proxy_args(&mut common_args);
         common_args.push(watch_url.to_string());
 
         let output = run_ytdlp_command("python", &common_args)
@@ -1318,7 +1342,10 @@ impl YouTubeClient {
 }
 
 fn run_ytdlp_command(program: &str, args: &[String]) -> Result<std::process::Output> {
-    let mut child = Command::new(program).args(args).spawn()?;
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    apply_command_proxy(&mut cmd);
+    let mut child = cmd.spawn()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(YT_DLP_TIMEOUT_SECS);
 
     loop {

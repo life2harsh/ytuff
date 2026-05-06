@@ -1003,7 +1003,7 @@ fn wimg_on() -> bool {
     if cmd.exists() {
         return true;
     }
-    
+
     Command::new(cmd)
         .arg("--help")
         .stdout(Stdio::null())

@@ -1,6 +1,7 @@
 use crate::core::track::Track;
 use crate::core::Core;
 use crate::media_controls::MediaSession;
+use crate::proxy::apply_command_proxy;
 use crate::sources::soundcloud::SoundCloudClient;
 use rand::seq::SliceRandom;
 use rodio::buffer::SamplesBuffer;
@@ -1149,6 +1150,8 @@ impl FfmpegPcmSource {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
+        apply_command_proxy(&mut cmd);
+
         let mut child = cmd.spawn().map_err(|err| {
             anyhow::anyhow!("Could not launch ffmpeg for streaming playback: {err}")
         })?;
@@ -1878,7 +1881,6 @@ pub fn start_audio_thread(
             if current_duration > 0 {
                 current_pos = current_pos.min(current_duration);
             }
-
             let playback_finished = sink
                 .as_ref()
                 .map(|s| !s.is_paused() && s.empty())

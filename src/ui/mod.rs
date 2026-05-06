@@ -39,6 +39,7 @@ pub enum ScReq {
     Logout,
     Art(String, String),
     Lyrics(Track),
+    LikeTrack(Track),
     DownloadTracks(Vec<Track>),
     DownloadCollection(String, String),
 }
@@ -401,6 +402,25 @@ impl App {
 
     fn cur_track(&self) -> Option<Track> {
         self.core.cur_id().and_then(|id| self.core.track(&id))
+    }
+
+    fn like_candidate_track(&self) -> Option<Track> {
+        self.cur_track()
+            .filter(|track| track.is_playable_remote() && track.acc != Some(Acc::Block))
+            .or_else(|| {
+                self.pick_track()
+                    .filter(|track| track.is_playable_remote() && track.acc != Some(Acc::Block))
+            })
+    }
+
+    fn like_selected_track(&mut self) {
+        let Some(track) = self.like_candidate_track() else {
+            self.note("select or play a YouTube track first");
+            return;
+        };
+        self.sc_busy = true;
+        self.note("saving to YouTube Music");
+        let _ = self.sc.tx.send(ScReq::LikeTrack(track));
     }
 
     fn download_selected(&mut self) {
@@ -1263,6 +1283,7 @@ pub fn run_ui(
                             let _ = app.pb.tx.send(PlaybackCommand::ToggleShuffle);
                         }
                         KeyCode::Char('a') => app.add_q(),
+                        KeyCode::Char('S') => app.like_selected_track(),
                         KeyCode::Char('c') => app.clear_queue(),
                         KeyCode::Char('P') => app.play_collection_action(),
                         KeyCode::Char('Q') => app.queue_collection_action(),
@@ -1561,6 +1582,22 @@ fn start_sc(
                 ScReq::Lyrics(track) => {
                     let res = lyrics.lookup_track(&track).map_err(|err| err.to_string());
                     let _ = etx.send(ScEvt::Lyrics(track.id.clone(), res));
+                }
+                ScReq::LikeTrack(track) => {
+                    let res = track
+                        .remote_video_id()
+                        .ok_or_else(|| "selected track is not a YouTube song".to_string())
+                        .and_then(|video_id| {
+                            sc.lock()
+                                .unwrap()
+                                .like_song(video_id)
+                                .map_err(|err| err.to_string())
+                        })
+                        .map(|_| format!("liked '{}' on YouTube Music", track.title));
+                    let _ = etx.send(ScEvt::Notice(match res {
+                        Ok(msg) => msg,
+                        Err(err) => err,
+                    }));
                 }
                 ScReq::DownloadTracks(tracks) => {
                     let cfg_snapshot = cfg.lock().unwrap().clone();
@@ -2271,6 +2308,8 @@ fn draw_foot(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(" play  "),
         hot("a"),
         Span::raw(" queue  "),
+        hot("S"),
+        Span::raw(" like  "),
         hot("c"),
         Span::raw(" clear queue  "),
         hot("P/Q"),
@@ -2319,6 +2358,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("enter play track, or open a selected youtube playlist or album"),
         Line::from("tab accept selected live suggestion in youtube search"),
         Line::from("a add selected track to queue"),
+        Line::from("S like the current or selected YouTube track on YouTube Music"),
         Line::from("c clear the current queue"),
         Line::from("P play a selected playlist/album, or restart the open collection"),
         Line::from("Q queue a selected playlist/album, or queue the open collection"),
