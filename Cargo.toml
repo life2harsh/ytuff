@@ -1,6 +1,6 @@
 [package]
 name = "ytuff"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "A fast and lightweight music player built with Rust"
 authors = ["Harsh Jha <jhaharsh29@gmail.com>"]
