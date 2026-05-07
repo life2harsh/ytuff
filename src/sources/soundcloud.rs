@@ -143,7 +143,7 @@ impl SoundCloudClient {
     pub fn new(ql: Ql) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(25))
-            .user_agent("rustplayer/0.1.0")
+            .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_else(|_| Client::new());
         let cfg = load_cfg();
@@ -230,9 +230,9 @@ impl SoundCloudClient {
                         }
                     }
                     let body = if ok {
-                        "<html><body><h2>RustPlayer is connected.</h2><p>You can return to the terminal.</p></body></html>"
+                        "<html><body><h2>YTuff is connected.</h2><p>You can return to the terminal.</p></body></html>"
                     } else {
-                        "<html><body><h2>RustPlayer login failed.</h2><p>Close this tab and try again.</p></body></html>"
+                        "<html><body><h2>YTuff login failed.</h2><p>Close this tab and try again.</p></body></html>"
                     };
                     let rsp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -541,7 +541,7 @@ fn load_cfg() -> Option<Cfg> {
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:8974/sc/cb".to_string());
     let mut dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    dir.push("rustplayer");
+    dir.push("ytuff");
     dir.push("soundcloud.json");
     Some(Cfg {
         id,

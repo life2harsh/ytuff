@@ -901,7 +901,7 @@ pub fn run_ui(
     let _ = app.pb.tx.send(PlaybackCommand::ListDevices);
     let mut overlay_was_active = false;
 
-    loop {
+    let clear_screen_on_exit = 'ui: loop {
         app.clean_msg();
         while let Ok(list) = app.pb.devices_rx.try_recv() {
             app.devs = list;
@@ -1035,7 +1035,7 @@ pub fn run_ui(
                 CEvent::Key(key) if key.kind == KeyEventKind::Press => {
                     if !app.inp && key.code == KeyCode::Char('M') {
                         match crate::tray::spawn_tray_process() {
-                            Ok(()) => break,
+                            Ok(()) => break 'ui true,
                             Err(err) => app.note(format!("tray error: {err}")),
                         }
                     }
@@ -1062,7 +1062,7 @@ pub fn run_ui(
                             }
                             KeyCode::Char('q') => {
                                 let _ = app.pb.tx.send(PlaybackCommand::Quit);
-                                break;
+                                break 'ui true;
                             }
                             KeyCode::Char('j') | KeyCode::Down => app.next_dev(),
                             KeyCode::Char('k') | KeyCode::Up => app.prev_dev(),
@@ -1092,7 +1092,7 @@ pub fn run_ui(
                             }
                             KeyCode::Char('q') => {
                                 let _ = app.pb.tx.send(PlaybackCommand::Quit);
-                                break;
+                                break 'ui true;
                             }
                             KeyCode::Char('j') | KeyCode::Down => app.next_fld(),
                             KeyCode::Char('k') | KeyCode::Up => app.prev_fld(),
@@ -1132,7 +1132,7 @@ pub fn run_ui(
                             }
                             KeyCode::Char('q') => {
                                 let _ = app.pb.tx.send(PlaybackCommand::Quit);
-                                break;
+                                break 'ui true;
                             }
                             _ => {}
                         }
@@ -1169,7 +1169,7 @@ pub fn run_ui(
                     match key.code {
                         KeyCode::Char('q') => {
                             let _ = app.pb.tx.send(PlaybackCommand::Quit);
-                            break;
+                            break 'ui true;
                         }
                         KeyCode::Char('s') => app.toggle_mode(),
                         KeyCode::Char('?') | KeyCode::Char('h') => {
@@ -1334,11 +1334,24 @@ pub fn run_ui(
                 _ => {}
             }
         }
-    }
+    };
 
     crossterm::terminal::disable_raw_mode()?;
     term.show_cursor()?;
+    drop(term);
+    if clear_screen_on_exit {
+        clear_terminal_screen()?;
+    }
     Ok(())
+}
+
+fn clear_terminal_screen() -> io::Result<()> {
+    let mut out = io::stdout();
+    crossterm::execute!(
+        out,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0)
+    )
 }
 
 fn apply_auth_session(
@@ -1805,7 +1818,7 @@ fn draw_head(f: &mut Frame, app: &App, area: Rect) {
         sc,
         Span::raw("   "),
         Span::styled(
-            format!("RustPlayer :: {}", app.sc_title),
+            format!("YTuff :: {}", app.sc_title),
             Style::default().fg(Color::Rgb(240, 244, 250)).bold(),
         ),
         Span::raw("   "),
@@ -1947,8 +1960,8 @@ fn draw_art_box(f: &mut Frame, app: &mut App, area: Rect) {
             inner,
             &[
                 "Artwork disabled",
-                "set RUSTPLAYER_ART=blocks",
-                "or set RUSTPLAYER_ART=kitty/wimg/sixel",
+                "set YTUFF_ART=blocks",
+                "or set YTUFF_ART=kitty/wimg/sixel",
             ],
             Alignment::Left,
         );
@@ -2349,7 +2362,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let box_a = centered(area, 68, 80);
     let lines = vec![
         Line::from(Span::styled(
-            "RustPlayer Keys",
+            "YTuff Keys",
             Style::default().fg(Color::Cyan).bold(),
         )),
         Line::from(""),
@@ -2384,13 +2397,13 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("l opens a dedicated YouTube Music login window on Windows or Linux"),
         Line::from("L clears the current in-app YouTube session"),
         Line::from("personalized home and library playlists use the captured session"),
-        Line::from("use: rustplayer auth cookie-file <cookies.txt>"),
-        Line::from("or : rustplayer auth cookie-header \"SID=...; SAPISID=...\""),
-        Line::from("or : rustplayer auth headers-file <headers.json>"),
-        Line::from("or : rustplayer auth login"),
-        Line::from("lyrics  : rustplayer lyrics [--cached] [--json]"),
-        Line::from("download: rustplayer download <url> --format m4a|mp3"),
-        Line::from("control : rustplayer status | play | pause | next"),
+        Line::from("use: ytuff auth cookie-file <cookies.txt>"),
+        Line::from("or : ytuff auth cookie-header \"SID=...; SAPISID=...\""),
+        Line::from("or : ytuff auth headers-file <headers.json>"),
+        Line::from("or : ytuff auth login"),
+        Line::from("lyrics  : ytuff lyrics [--cached] [--json]"),
+        Line::from("download: ytuff download <url> --format m4a|mp3"),
+        Line::from("control : ytuff status | play | pause | next"),
         Line::from("q or esc closes overlays, q quits app, M minimizes to tray"),
     ];
     let p = Paragraph::new(Text::from(lines))
@@ -2658,7 +2671,7 @@ fn temp_preview_path(ext: &str) -> std::path::PathBuf {
         .unwrap_or_default()
         .as_millis();
     let mut path = std::env::temp_dir();
-    path.push(format!("rustplayer-art-{stamp}.{ext}"));
+    path.push(format!("ytuff-art-{stamp}.{ext}"));
     path
 }
 

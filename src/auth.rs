@@ -13,8 +13,8 @@ const LOGIN_URL: &str =
 const MUSIC_URL: &str = "https://music.youtube.com";
 const VIDEO_URL: &str = "https://www.youtube.com";
 const TITLE_WAITING: &str =
-    "RustPlayer YouTube Login - sign in, then close this window when you are done";
-const TITLE_READY: &str = "RustPlayer YouTube Login - signed in, close this window to finish";
+    "YTuff YouTube Login - sign in, then close this window when you are done";
+const TITLE_READY: &str = "YTuff YouTube Login - signed in, close this window to finish";
 
 const AUTH_IPC_SCRIPT: &str = r#"
 (() => {
@@ -32,7 +32,7 @@ const AUTH_IPC_SCRIPT: &str = r#"
         authUser = String(cfg.SESSION_INDEX);
       }
       window.ipc.postMessage(JSON.stringify({
-        kind: "rustplayer_auth",
+        kind: "ytuff_auth",
         url: window.location.href,
         authUser,
         title: document.title || null
@@ -576,7 +576,7 @@ mod linux {
 
         gtk::init().map_err(|err| {
             anyhow!(
-                "Could not initialize GTK for the YouTube login window: {}. Start RustPlayer from a graphical Linux session and try again.",
+                "Could not initialize GTK for the YouTube login window: {}. Start YTuff from a graphical Linux session and try again.",
                 err
             )
         })

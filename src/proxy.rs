@@ -2,7 +2,8 @@ use reqwest::blocking::ClientBuilder;
 use reqwest::Proxy;
 use std::process::Command;
 
-const PROXY_ENV_KEYS: [&str; 7] = [
+const PROXY_ENV_KEYS: [&str; 8] = [
+    "YTUFF_PROXY",
     "RUSTPLAYER_PROXY",
     "ALL_PROXY",
     "HTTPS_PROXY",
@@ -37,15 +38,7 @@ pub fn apply_command_proxy(cmd: &mut Command) {
         return;
     };
 
-    for key in [
-        "RUSTPLAYER_PROXY",
-        "ALL_PROXY",
-        "HTTPS_PROXY",
-        "HTTP_PROXY",
-        "all_proxy",
-        "https_proxy",
-        "http_proxy",
-    ] {
+    for key in PROXY_ENV_KEYS {
         cmd.env(key, &proxy_url);
     }
 }

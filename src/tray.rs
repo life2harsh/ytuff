@@ -27,7 +27,7 @@ pub fn spawn_tray_process() -> Result<()> {
 
 pub fn run_tray(paths: AppPaths, _cfg: AppConfig) -> Result<()> {
     // Keep the lock file alive for the lifetime of the tray process.
-    let lock_path = paths.cache_dir.join("rustplayer.tray.lock");
+    let lock_path = paths.cache_dir.join("ytuff.tray.lock");
     let lock_file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -96,7 +96,7 @@ mod windows {
     const WM_TRAYICON: u32 = WM_APP + 1;
 
     pub fn run(exe: std::path::PathBuf) -> Result<()> {
-        let class_name = to_wstring("RustPlayerTray");
+        let class_name = to_wstring("YTuffTray");
 
         unsafe {
             let hinstance = GetModuleHandleW(std::ptr::null());
@@ -145,7 +145,7 @@ mod windows {
             nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
             nid.uCallbackMessage = WM_TRAYICON;
             nid.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION as *const u16);
-            set_tip(&mut nid, "RustPlayer");
+            set_tip(&mut nid, "YTuff");
 
             if Shell_NotifyIconW(NIM_ADD, &mut nid) == 0 {
                 Shell_NotifyIconW(NIM_DELETE, &mut nid);

@@ -1,10 +1,12 @@
-# RustPlayer
+# YTuff
 
-RustPlayer is a terminal music player for local files and YouTube Music. it has a full TUI, a background playback daemon, playlists, downloads, lyrics, artwork, media controls, and local library scanning.
+YTuff is a terminal music player for local files and YouTube Music. it has a full TUI, a background playback daemon, playlists, downloads, lyrics, artwork, media controls, and local library scanning.
 
 first of all, shoutout @Metrolist. they made the API part of the project pretty easy. i personally hate kotlin, but i love what they made out of it. all my best wishes and prayers to you guys. 
 
 fun fact: this originally started out as a SoundCloud terminal client, almost an year ago, or atleast i started planning it at that time. because the SoundCloud API said "if your application streams or uses SoundCloud data, it has to have the powered by SoundCloud logo" . well, i can't pay 15usd a month for artist pro. i'm broke. so then, i shifted to YT and well, here we are.
+
+previously named rustplayer, because made in rust and music player, but since the name was taken, ytuff it is.
 
 ## Features
 
@@ -35,7 +37,7 @@ fun fact: this originally started out as a SoundCloud terminal client, almost an
 
 
 ```text
-RustPlayer TUI
+YTuff TUI
 Local library + YouTube Music + queue + artwork
 ```
 
@@ -48,13 +50,13 @@ Download the latest Windows release zip from Releases.
 Extract it and run:
 
 ```powershell
-.\rustplayer.exe tui
+.\ytuff.exe tui
 ```
 
 The Windows release is portable. It should include:
 
 ```text
-rustplayer.exe
+ytuff.exe
 wimg.exe
 ffmpeg.exe
 ffprobe.exe
@@ -71,7 +73,7 @@ README.txt
 
 Do not delete the DLL files. They are required by the bundled `wimg.exe` renderer.
 
-To make `rustplayer` available from any terminal, run:
+To make `ytuff` available from any terminal, run:
 
 ```powershell
 .\install-user.bat
@@ -80,7 +82,7 @@ To make `rustplayer` available from any terminal, run:
 Restart your terminal, then run:
 
 ```powershell
-rustplayer tui
+ytuff tui
 ```
 
 ### Linux
@@ -88,7 +90,7 @@ rustplayer tui
 Download the Linux tarball, extract it, and run:
 
 ```bash
-./rustplayer tui
+./ytuff tui
 ```
 
 Install to your user PATH:
@@ -100,7 +102,7 @@ Install to your user PATH:
 Then run:
 
 ```bash
-rustplayer tui
+ytuff tui
 ```
 
 Linux builds expect system dependencies to be installed through your distro package manager.
@@ -124,59 +126,59 @@ If your distro does not package `libwebkit2gtk-4.1`, install the closest WebKitG
 Start the TUI:
 
 ```bash
-rustplayer tui
+ytuff tui
 ```
 
 Search YouTube Music:
 
 ```bash
-rustplayer search "daft punk" --limit 10
+ytuff search "daft punk" --limit 10
 ```
 
 Play something:
 
 ```bash
-rustplayer play "never gonna give you up"
+ytuff play "never gonna give you up"
 ```
 
 Pause, resume, skip, or stop:
 
 ```bash
-rustplayer pause
-rustplayer resume
-rustplayer next
-rustplayer stop
+ytuff pause
+ytuff resume
+ytuff next
+ytuff stop
 ```
 
 Check status:
 
 ```bash
-rustplayer status
+ytuff status
 ```
 
 Stop the background daemon:
 
 ```bash
-rustplayer shutdown
+ytuff shutdown
 ```
 
 ## Terminal artwork
 
-RustPlayer supports multiple artwork renderers.
+YTuff supports multiple artwork renderers.
 
 Set one manually:
 
 Windows PowerShell:
 
 ```powershell
-$env:RUSTPLAYER_ART="wimg"
-.\rustplayer.exe tui
+$env:YTUFF_ART="wimg"
+.\ytuff.exe tui
 ```
 
 Linux shell:
 
 ```bash
-RUSTPLAYER_ART=kitty ./rustplayer tui
+YTUFF_ART=kitty ./ytuff tui
 ```
 
 Supported renderer values:
@@ -204,14 +206,14 @@ The Windows release bundles `wimg.exe` and its DLLs. Linux builds do not need `w
 To force a specific `wimg.exe` path on Windows:
 
 ```powershell
-$env:RUSTPLAYER_WIMG="C:\path\to\wimg.exe"
+$env:YTUFF_WIMG="C:\path\to\wimg.exe"
 ```
 
-The packaged Windows release should not need this because `wimg.exe` is bundled beside `rustplayer.exe`.
+The packaged Windows release should not need this because `wimg.exe` is bundled beside `ytuff.exe`.
 
 ## TUI controls
 
-Press `?` or `h` inside RustPlayer to open the built in help.
+Press `?` or `h` inside YTuff to open the built in help.
 
 | Key              | Action                                                 |
 | ---------------- | ------------------------------------------------------ |
@@ -258,31 +260,31 @@ Press `?` or `h` inside RustPlayer to open the built in help.
 Add a folder:
 
 ```bash
-rustplayer library add-path "/path/to/Music"
+ytuff library add-path "/path/to/Music"
 ```
 
 Windows example:
 
 ```powershell
-rustplayer library add-path "D:\Music"
+ytuff library add-path "D:\Music"
 ```
 
 List folders:
 
 ```bash
-rustplayer library list-paths
+ytuff library list-paths
 ```
 
 Remove a folder by index:
 
 ```bash
-rustplayer library remove-path 0
+ytuff library remove-path 0
 ```
 
 You can also pass scan paths when starting the app:
 
 ```bash
-rustplayer --path "/path/to/Music" tui
+ytuff --path "/path/to/Music" tui
 ```
 
 Supported local file extensions include:
@@ -291,40 +293,40 @@ Supported local file extensions include:
 mp3, flac, wav, m4a, ogg, aac, opus, wma
 ```
 
-RustPlayer uses FFmpeg as a fallback for formats that the native decoder does not handle cleanly.
+YTuff uses FFmpeg as a fallback for formats that the native decoder does not handle cleanly.
 
 ## YouTube Music auth
 
-Guest playback works for many tracks, but YouTube can block or limit some requests. Signing in gives RustPlayer access to personalized home, account playlists, and more reliable playback.
+Guest playback works for many tracks, but YouTube can block or limit some requests. Signing in gives YTuff access to personalized home, account playlists, and more reliable playback.
 
 Open the login window:
 
 ```bash
-rustplayer auth login
+ytuff auth login
 ```
 
 Show current auth state:
 
 ```bash
-rustplayer auth show
+ytuff auth show
 ```
 
 Import a cookie file:
 
 ```bash
-rustplayer auth cookie-file cookies.txt
+ytuff auth cookie-file cookies.txt
 ```
 
 Import a raw cookie header:
 
 ```bash
-rustplayer auth cookie-header "SID=...; SAPISID=..."
+ytuff auth cookie-header "SID=...; SAPISID=..."
 ```
 
 Import `ytmusicapi` headers:
 
 ```bash
-rustplayer auth headers-file headers.json
+ytuff auth headers-file headers.json
 ```
 
 Sign out from the TUI with `L`.
@@ -334,19 +336,19 @@ Sign out from the TUI with `L`.
 Add something to the queue:
 
 ```bash
-rustplayer queue add "aphex twin xtal"
+ytuff queue add "aphex twin xtal"
 ```
 
 Show the queue:
 
 ```bash
-rustplayer queue show
+ytuff queue show
 ```
 
 Clear the queue:
 
 ```bash
-rustplayer queue clear
+ytuff queue clear
 ```
 
 ## Playlists
@@ -354,49 +356,49 @@ rustplayer queue clear
 Create a playlist:
 
 ```bash
-rustplayer playlist create mix
+ytuff playlist create mix
 ```
 
 List playlists:
 
 ```bash
-rustplayer playlist list
+ytuff playlist list
 ```
 
 Show a playlist:
 
 ```bash
-rustplayer playlist show mix
+ytuff playlist show mix
 ```
 
 Add a track:
 
 ```bash
-rustplayer playlist add mix "https://music.youtube.com/watch?v=lYBUbBu4W08"
+ytuff playlist add mix "https://music.youtube.com/watch?v=lYBUbBu4W08"
 ```
 
 Import a YouTube playlist or album:
 
 ```bash
-rustplayer playlist import "https://music.youtube.com/playlist?list=..." --name my-playlist
+ytuff playlist import "https://music.youtube.com/playlist?list=..." --name my-playlist
 ```
 
 Play a playlist:
 
 ```bash
-rustplayer playlist play mix
+ytuff playlist play mix
 ```
 
 Queue a playlist:
 
 ```bash
-rustplayer playlist enqueue mix
+ytuff playlist enqueue mix
 ```
 
 Download a playlist:
 
 ```bash
-rustplayer playlist download mix --format m4a
+ytuff playlist download mix --format m4a
 ```
 
 ## Lyrics
@@ -404,19 +406,19 @@ rustplayer playlist download mix --format m4a
 Show lyrics for the current track:
 
 ```bash
-rustplayer lyrics
+ytuff lyrics
 ```
 
 Use cached lyrics only:
 
 ```bash
-rustplayer lyrics --cached
+ytuff lyrics --cached
 ```
 
 Return JSON:
 
 ```bash
-rustplayer lyrics --json
+ytuff lyrics --json
 ```
 
 In the TUI, press `y` to open lyrics for the current track.
@@ -426,25 +428,25 @@ In the TUI, press `y` to open lyrics for the current track.
 Download a track as M4A:
 
 ```bash
-rustplayer download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format m4a
+ytuff download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format m4a
 ```
 
 Download as MP3:
 
 ```bash
-rustplayer download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format mp3
+ytuff download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format mp3
 ```
 
 Choose an output folder:
 
 ```bash
-rustplayer download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format mp3 --output "/path/to/output"
+ytuff download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format mp3 --output "/path/to/output"
 ```
 
 Windows example:
 
 ```powershell
-rustplayer download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format mp3 --output "D:\Music"
+ytuff download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format mp3 --output "D:\Music"
 ```
 
 ## Autoplay and sleep timer
@@ -452,25 +454,25 @@ rustplayer download "https://music.youtube.com/watch?v=lYBUbBu4W08" --format mp3
 Enable autoplay:
 
 ```bash
-rustplayer autoplay on
+ytuff autoplay on
 ```
 
 Disable autoplay:
 
 ```bash
-rustplayer autoplay off
+ytuff autoplay off
 ```
 
 Set a sleep timer:
 
 ```bash
-rustplayer sleep 30
+ytuff sleep 30
 ```
 
 Clear the sleep timer:
 
 ```bash
-rustplayer sleep --off
+ytuff sleep --off
 ```
 
 ## JSON output
@@ -478,11 +480,11 @@ rustplayer sleep --off
 Some commands support JSON output through the global `--json` flag.
 
 ```bash
-rustplayer --json status
+ytuff --json status
 ```
 
 ```bash
-rustplayer --json search "boards of canada" --limit 5
+ytuff --json search "boards of canada" --limit 5
 ```
 
 ## Configuration
@@ -490,10 +492,10 @@ rustplayer --json search "boards of canada" --limit 5
 Print the current config:
 
 ```bash
-rustplayer config
+ytuff config
 ```
 
-RustPlayer stores config, playlist data, downloads, and cached lyrics in your OS app directories under `rustplayer`.
+YTuff stores config, playlist data, downloads, and cached lyrics in your OS app directories under `ytuff`.
 
 Important config values include:
 
@@ -536,7 +538,7 @@ cargo run --release -- shutdown
 On Windows, if the daemon does not respond:
 
 ```powershell
-taskkill /IM rustplayer.exe /F
+taskkill /IM ytuff.exe /F
 ```
 
 ## Build dependencies
@@ -549,7 +551,7 @@ For normal development:
 cargo build --release
 ```
 
-The Windows release bundles a prebuilt `wimg.exe`, its DLLs, `ffmpeg.exe`, and `ffprobe.exe`. You do not need to rebuild `wimg` for a normal RustPlayer release.
+The Windows release bundles a prebuilt `wimg.exe`, its DLLs, `ffmpeg.exe`, and `ffprobe.exe`. You do not need to rebuild `wimg` for a normal YTuff release.
 
 ### Arch / Manjaro
 
@@ -568,18 +570,18 @@ sudo apt install build-essential pkg-config curl ca-certificates libssl-dev liba
 
 Run this in PowerShell from the repository root.
 
-It builds RustPlayer, creates a clean release folder, copies the bundled `wimg` runtime files, copies FFmpeg, creates PATH installer scripts, and zips the result.
+It builds YTuff, creates a clean release folder, copies the bundled `wimg` runtime files, copies FFmpeg, creates PATH installer scripts, and zips the result.
 
 ```powershell
-cd H:\desktop\rustplayer
+cd H:\desktop\ytuff
 
-$source = "H:\desktop\rustplayer\target\release"
-$dist = "H:\desktop\rustplayer\dist\rustplayer-windows-x64"
-$zip = "H:\desktop\rustplayer\dist\rustplayer-windows-x64.zip"
+$source = "H:\desktop\ytuff\target\release"
+$dist = "H:\desktop\ytuff\dist\ytuff-windows-x64"
+$zip = "H:\desktop\ytuff\dist\ytuff-windows-x64.zip"
 $ffmpegDir = "C:\Users\jhaha\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0-full_build\bin"
 
 cargo run --release -- shutdown 2>$null
-taskkill /IM rustplayer.exe /F 2>$null
+taskkill /IM ytuff.exe /F 2>$null
 
 cargo build --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
@@ -588,7 +590,7 @@ Remove-Item $dist -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $dist | Out-Null
 
 $requiredSourceFiles = @(
-  "rustplayer.exe",
+  "ytuff.exe",
   "wimg.exe",
   "libgcc_s_seh-1.dll",
   "libjpeg-8.dll",
@@ -632,17 +634,17 @@ foreach ($part in $parts) {
 }
 
 if ($alreadyInstalled) {
-    Write-Host "RustPlayer is already in your user PATH."
+    Write-Host "YTuff is already in your user PATH."
 } else {
     $newParts = @($parts + $AppDir)
     $newPath = ($newParts | Select-Object -Unique) -join ";"
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-    Write-Host "RustPlayer was added to your user PATH."
+    Write-Host "YTuff was added to your user PATH."
 }
 
 Write-Host ""
 Write-Host "Restart your terminal, then run:"
-Write-Host "  rustplayer tui"
+Write-Host "  ytuff tui"
 Write-Host ""
 Read-Host "Press Enter to close"
 '@ | Set-Content -Path "$dist\install-user.ps1" -Encoding UTF8
@@ -653,17 +655,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install-user.ps1"
 '@ | Set-Content -Path "$dist\install-user.bat" -Encoding ASCII
 
 @'
-RustPlayer Windows x64
+YTuff Windows x64
 
 Run:
-  rustplayer.exe tui
+  ytuff.exe tui
 
-To install rustplayer into your user PATH:
+To install ytuff into your user PATH:
   Double-click install-user.bat
 
 After installing:
   Restart your terminal
-  Run: rustplayer tui
+  Run: ytuff tui
 
 Do not delete these files:
   wimg.exe
@@ -683,16 +685,16 @@ Get-ChildItem $dist
 Test the packaged Windows build:
 
 ```powershell
-cd H:\desktop\rustplayer\dist\rustplayer-windows-x64
-Remove-Item Env:RUSTPLAYER_WIMG -ErrorAction SilentlyContinue
-$env:RUSTPLAYER_ART="wimg"
-.\rustplayer.exe tui
+cd H:\desktop\ytuff\dist\ytuff-windows-x64
+Remove-Item Env:YTUFF_WIMG -ErrorAction SilentlyContinue
+$env:YTUFF_ART="wimg"
+.\ytuff.exe tui
 ```
 
 A clean Windows release folder should contain:
 
 ```text
-rustplayer.exe
+ytuff.exe
 wimg.exe
 ffmpeg.exe
 ffprobe.exe
@@ -733,13 +735,13 @@ end
 cargo clean; or exit 1
 cargo build --release; or exit 1
 
-set dist dist/rustplayer-linux-x86_64
-set tarball dist/rustplayer-linux-x86_64-arch.tar.gz
+set dist dist/ytuff-linux-x86_64
+set tarball dist/ytuff-linux-x86_64-arch.tar.gz
 
 rm -rf $dist
 mkdir -p $dist
 
-cp target/release/rustplayer $dist/rustplayer; or exit 1
+cp target/release/ytuff $dist/ytuff; or exit 1
 
 printf '%s\n' \
 '#!/usr/bin/env bash' \
@@ -747,7 +749,7 @@ printf '%s\n' \
 '' \
 'APPDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' \
 'mkdir -p "$HOME/.local/bin"' \
-'ln -sf "$APPDIR/rustplayer" "$HOME/.local/bin/rustplayer"' \
+'ln -sf "$APPDIR/ytuff" "$HOME/.local/bin/ytuff"' \
 '' \
 'if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then' \
 '  echo ""' \
@@ -757,37 +759,37 @@ printf '%s\n' \
 '  echo ""' \
 'fi' \
 '' \
-'echo "Installed rustplayer to ~/.local/bin/rustplayer"' \
-'echo "Run: rustplayer tui"' \
+'echo "Installed ytuff to ~/.local/bin/ytuff"' \
+'echo "Run: ytuff tui"' \
 > $dist/install-user.sh
 
 chmod +x $dist/install-user.sh
 
 printf '%s\n' \
-'RustPlayer Linux x86_64' \
+'YTuff Linux x86_64' \
 '' \
 'Run:' \
-'  ./rustplayer tui' \
+'  ./ytuff tui' \
 '' \
 'Install to user PATH:' \
 '  ./install-user.sh' \
 '' \
 'Then run:' \
-'  rustplayer tui' \
+'  ytuff tui' \
 '' \
 'Dependencies:' \
 '  Arch / Manjaro: sudo pacman -S ffmpeg webkit2gtk-4.1 gtk3 alsa-lib' \
 '  Ubuntu / Debian: sudo apt install ffmpeg libwebkit2gtk-4.1-0 libgtk-3-0 libasound2' \
 '' \
 'Artwork options:' \
-'  RUSTPLAYER_ART=kitty ./rustplayer tui' \
-'  RUSTPLAYER_ART=sixel ./rustplayer tui' \
-'  RUSTPLAYER_ART=blocks ./rustplayer tui' \
-'  RUSTPLAYER_ART=off ./rustplayer tui' \
+'  YTUFF_ART=kitty ./ytuff tui' \
+'  YTUFF_ART=sixel ./ytuff tui' \
+'  YTUFF_ART=blocks ./ytuff tui' \
+'  YTUFF_ART=off ./ytuff tui' \
 > $dist/README.txt
 
 rm -f $tarball
-tar -C dist -czf $tarball rustplayer-linux-x86_64; or exit 1
+tar -C dist -czf $tarball ytuff-linux-x86_64; or exit 1
 
 echo "Built: $tarball"
 ls -lh $tarball
@@ -796,14 +798,14 @@ ls -lh $tarball
 Test the packaged Linux build:
 
 ```fish
-cd dist/rustplayer-linux-x86_64
-RUSTPLAYER_ART=kitty ./rustplayer tui
+cd dist/ytuff-linux-x86_64
+YTUFF_ART=kitty ./ytuff tui
 ```
 
 Fallback if your terminal graphics are not set up:
 
 ```fish
-RUSTPLAYER_ART=blocks ./rustplayer tui
+YTUFF_ART=blocks ./ytuff tui
 ```
 
 ## Release files
@@ -811,14 +813,14 @@ RUSTPLAYER_ART=blocks ./rustplayer tui
 Recommended release assets:
 
 ```text
-rustplayer-windows-x64.zip
-rustplayer-linux-x86_64-arch.tar.gz
+ytuff-windows-x64.zip
+ytuff-linux-x86_64-arch.tar.gz
 ```
 
 If you build Linux on Ubuntu or Debian for broader compatibility, name it:
 
 ```text
-rustplayer-linux-x86_64.tar.gz
+ytuff-linux-x86_64.tar.gz
 ```
 
 A Linux binary built on Arch may depend on newer system libraries than older Ubuntu or Debian systems have. For public Linux releases, building on Ubuntu LTS or Debian stable is usually safer.
@@ -830,11 +832,11 @@ A Linux binary built on Arch may depend on newer system libraries than older Ubu
 Use Windows Terminal and make sure Sixel support is available. Then force `wimg`:
 
 ```powershell
-$env:RUSTPLAYER_ART="wimg"
-.\rustplayer.exe tui
+$env:YTUFF_ART="wimg"
+.\ytuff.exe tui
 ```
 
-Make sure these files are beside `rustplayer.exe`:
+Make sure these files are beside `ytuff.exe`:
 
 ```text
 wimg.exe
@@ -846,7 +848,7 @@ libwinpthread-1.dll
 zlib1.dll
 ```
 
-### RustPlayer is using the wrong `wimg.exe`
+### YTuff is using the wrong `wimg.exe`
 
 Check PATH:
 
@@ -857,10 +859,10 @@ where.exe wimg
 Force the exact renderer:
 
 ```powershell
-$env:RUSTPLAYER_WIMG="C:\path\to\wimg.exe"
+$env:YTUFF_WIMG="C:\path\to\wimg.exe"
 ```
 
-For packaged releases, keep `wimg.exe` beside `rustplayer.exe`.
+For packaged releases, keep `wimg.exe` beside `ytuff.exe`.
 
 ### Local files show up but do not play
 
@@ -899,19 +901,19 @@ If FFmpeg prints nothing and exits, it can decode the file.
 Stop the old daemon:
 
 ```bash
-rustplayer shutdown
+ytuff shutdown
 ```
 
 On Windows:
 
 ```powershell
-taskkill /IM rustplayer.exe /F
+taskkill /IM ytuff.exe /F
 ```
 
 Then start again:
 
 ```bash
-rustplayer tui
+ytuff tui
 ```
 
 ### Search works but playback does not
@@ -921,7 +923,7 @@ Search and playback are separate paths. Search can work while the daemon or FFmp
 Check:
 
 ```bash
-rustplayer status
+ytuff status
 ffmpeg -version
 ```
 
@@ -932,13 +934,13 @@ Restart the daemon before testing again.
 Try logging in:
 
 ```bash
-rustplayer auth login
+ytuff auth login
 ```
 
 If needed, import headers:
 
 ```bash
-rustplayer auth headers-file headers.json
+ytuff auth headers-file headers.json
 ```
 
 ### The Windows zip works on your machine but not on another PC

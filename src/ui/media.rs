@@ -23,6 +23,10 @@ const KITTY_LOGO_IMAGE_ID: u32 = 2002;
 const KITTY_PLACEMENT_ID: u32 = 1;
 const KITTY_CHUNK_SIZE: usize = 4096;
 
+fn env_var_any(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| env::var(key).ok())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ArtRenderer {
     Off,
@@ -34,7 +38,7 @@ enum ArtRenderer {
 
 impl ArtRenderer {
     fn from_env() -> Self {
-        if let Ok(value) = env::var("RUSTPLAYER_ART") {
+        if let Some(value) = env_var_any(&["YTUFF_ART", "RUSTPLAYER_ART"]) {
             let value = value.trim().to_ascii_lowercase();
             return match value.as_str() {
                 "off" | "0" | "false" => Self::Off,
@@ -844,7 +848,7 @@ fn near(pal: &[(u8, u8, u8)], c: (u8, u8, u8)) -> u8 {
 }
 
 fn sixel_on() -> bool {
-    if let Ok(v) = env::var("RUSTPLAYER_SIXEL") {
+    if let Some(v) = env_var_any(&["YTUFF_SIXEL", "RUSTPLAYER_SIXEL"]) {
         let v = v.trim().to_ascii_lowercase();
         if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
             return true;
@@ -871,7 +875,7 @@ fn sixel_on() -> bool {
 }
 
 fn kitty_on() -> bool {
-    if let Ok(v) = env::var("RUSTPLAYER_KITTY") {
+    if let Some(v) = env_var_any(&["YTUFF_KITTY", "RUSTPLAYER_KITTY"]) {
         let v = v.trim().to_ascii_lowercase();
         if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
             return true;
@@ -908,13 +912,17 @@ fn kitty_on() -> bool {
 
 fn art_cell_pixels() -> (u32, u32) {
     let (default_w, default_h) = if cfg!(windows) { (8, 16) } else { (10, 20) };
-    let w = env_u32("RUSTPLAYER_ART_CELL_W").unwrap_or(default_w).max(1);
-    let h = env_u32("RUSTPLAYER_ART_CELL_H").unwrap_or(default_h).max(1);
+    let w = env_u32_any(&["YTUFF_ART_CELL_W", "RUSTPLAYER_ART_CELL_W"])
+        .unwrap_or(default_w)
+        .max(1);
+    let h = env_u32_any(&["YTUFF_ART_CELL_H", "RUSTPLAYER_ART_CELL_H"])
+        .unwrap_or(default_h)
+        .max(1);
     (w, h)
 }
 
-fn env_u32(name: &str) -> Option<u32> {
-    env::var(name).ok()?.trim().parse().ok()
+fn env_u32_any(keys: &[&str]) -> Option<u32> {
+    env_var_any(keys)?.trim().parse().ok()
 }
 
 fn wrap_sixel(six: String) -> Vec<u8> {
@@ -970,7 +978,7 @@ fn normalize_graphic(buf: Vec<u8>) -> Vec<u8> {
 }
 
 pub(crate) fn wimg_command() -> std::path::PathBuf {
-    if let Ok(value) = env::var("RUSTPLAYER_WIMG") {
+    if let Some(value) = env_var_any(&["YTUFF_WIMG", "RUSTPLAYER_WIMG"]) {
         let value = value.trim();
         if !value.is_empty() {
             return std::path::PathBuf::from(value);
@@ -1019,7 +1027,7 @@ fn temp_wimg_path() -> std::path::PathBuf {
         .as_millis();
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "rustplayer-wimg-{}-{stamp}.png",
+        "ytuff-wimg-{}-{stamp}.png",
         std::process::id()
     ));
     path

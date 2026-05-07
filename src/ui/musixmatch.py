@@ -157,7 +157,7 @@ def search_tracks(title, artist=None):
     response = requests.get(
         LRCLIB_SEARCH,
         params=params,
-        headers={"User-Agent": "rustplayer-dev"},
+        headers={"User-Agent": "ytuff-dev"},
         timeout=10,
     )
     response.raise_for_status()

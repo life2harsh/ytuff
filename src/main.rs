@@ -42,12 +42,21 @@ use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
+#[cfg(target_os = "windows")]
+const STARTUP_SCRIPT_NAME: &str = "ytuff-daemon.cmd";
+#[cfg(target_os = "windows")]
+const LEGACY_STARTUP_SCRIPT_NAME: &str = "rustplayer-daemon.cmd";
+#[cfg(target_os = "linux")]
+const STARTUP_UNIT_NAME: &str = "ytuff.service";
+#[cfg(target_os = "linux")]
+const LEGACY_STARTUP_UNIT_NAME: &str = "rustplayer.service";
+
 #[derive(Parser, Debug)]
 #[command(
-    name = "rustplayer",
+    name = "ytuff",
     version,
     about = "A high-performance terminal music player with YouTube streaming",
-    after_help = "Auth note:\n  On Windows and Linux, RustPlayer can open a dedicated YouTube Music login window with\n  'rustplayer auth login'.\n  Manual cookie login is still supported through\n  'rustplayer auth cookie-file <cookies.txt>' or\n  'rustplayer auth cookie-header \"SID=...; SAPISID=...\"'.\n  You can also import ytmusicapi headers.json via\n  'rustplayer auth headers-file <headers.json>'.\n\nProxy note:\n  Set RUSTPLAYER_PROXY to a standard proxy URL when native requests need a tunnel,\n  for example 'socks5://127.0.0.1:1080' or 'http://127.0.0.1:8080'.\n\nExamples:\n  rustplayer auth login\n  rustplayer auth show\n  rustplayer auth headers-file headers.json\n  rustplayer status\n  rustplayer play \"never gonna give you up\"\n  rustplayer like\n  rustplayer download \"https://music.youtube.com/watch?v=lYBUbBu4W08\" --format mp3\n  rustplayer playlist create mix"
+    after_help = "Auth note:\n  On Windows and Linux, YTuff can open a dedicated YouTube Music login window with\n  'ytuff auth login'.\n  Manual cookie login is still supported through\n  'ytuff auth cookie-file <cookies.txt>' or\n  'ytuff auth cookie-header \"SID=...; SAPISID=...\"'.\n  You can also import ytmusicapi headers.json via\n  'ytuff auth headers-file <headers.json>'.\n\nProxy note:\n  Set YTUFF_PROXY to a standard proxy URL when native requests need a tunnel,\n  for example 'socks5://127.0.0.1:1080' or 'http://127.0.0.1:8080'.\n\nExamples:\n  ytuff auth login\n  ytuff auth show\n  ytuff auth headers-file headers.json\n  ytuff status\n  ytuff play \"never gonna give you up\"\n  ytuff like\n  ytuff download \"https://music.youtube.com/watch?v=lYBUbBu4W08\" --format mp3\n  ytuff playlist create mix"
 )]
 struct Cli {
     #[arg(short = 'p', long = "path", global = true, value_name = "DIR")]
@@ -1031,36 +1040,42 @@ fn configure_startup(enabled: bool) -> Result<String> {
 fn install_startup() -> Result<()> {
     let exe = std::env::current_exe().context("Could not resolve current executable")?;
     let appdata = std::env::var_os("APPDATA").ok_or_else(|| anyhow!("APPDATA is not set"))?;
-    let path = PathBuf::from(appdata)
+    let startup_dir = PathBuf::from(appdata)
         .join("Microsoft")
         .join("Windows")
         .join("Start Menu")
         .join("Programs")
-        .join("Startup")
-        .join("rustplayer-daemon.cmd");
+        .join("Startup");
+    let path = startup_dir.join(STARTUP_SCRIPT_NAME);
+    let legacy_path = startup_dir.join(LEGACY_STARTUP_SCRIPT_NAME);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let script = format!(
-        "@echo off\r\nstart \"RustPlayer\" /min \"{}\" daemon\r\n",
+        "@echo off\r\nstart \"YTuff\" /min \"{}\" daemon\r\n",
         exe.display()
     );
-    fs::write(path, script)?;
+    fs::write(&path, script)?;
+    if legacy_path.exists() {
+        let _ = fs::remove_file(legacy_path);
+    }
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 fn uninstall_startup() -> Result<()> {
     let appdata = std::env::var_os("APPDATA").ok_or_else(|| anyhow!("APPDATA is not set"))?;
-    let path = PathBuf::from(appdata)
+    let startup_dir = PathBuf::from(appdata)
         .join("Microsoft")
         .join("Windows")
         .join("Start Menu")
         .join("Programs")
-        .join("Startup")
-        .join("rustplayer-daemon.cmd");
-    if path.exists() {
-        fs::remove_file(path)?;
+        .join("Startup");
+    for name in [STARTUP_SCRIPT_NAME, LEGACY_STARTUP_SCRIPT_NAME] {
+        let path = startup_dir.join(name);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
     }
     Ok(())
 }
@@ -1071,17 +1086,24 @@ fn install_startup() -> Result<()> {
     let config_dir = dirs::config_dir().ok_or_else(|| anyhow!("Could not locate config dir"))?;
     let unit_dir = config_dir.join("systemd").join("user");
     fs::create_dir_all(&unit_dir)?;
-    let unit_path = unit_dir.join("rustplayer.service");
+    let unit_path = unit_dir.join(STARTUP_UNIT_NAME);
+    let legacy_unit_path = unit_dir.join(LEGACY_STARTUP_UNIT_NAME);
     let unit = format!(
-        "[Unit]\nDescription=RustPlayer background daemon\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=YTuff background daemon\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
         shell_escape_arg(&exe.display().to_string())
     );
     fs::write(&unit_path, unit)?;
     let _ = ProcessCommand::new("systemctl")
+        .args(["--user", "disable", "--now", LEGACY_STARTUP_UNIT_NAME])
+        .status();
+    if legacy_unit_path.exists() {
+        let _ = fs::remove_file(legacy_unit_path);
+    }
+    let _ = ProcessCommand::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status();
     let status = ProcessCommand::new("systemctl")
-        .args(["--user", "enable", "--now", "rustplayer.service"])
+        .args(["--user", "enable", "--now", STARTUP_UNIT_NAME])
         .status();
     if status.as_ref().is_err() || !status.unwrap().success() {
         return Err(anyhow!(
@@ -1094,16 +1116,18 @@ fn install_startup() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn uninstall_startup() -> Result<()> {
-    let _ = ProcessCommand::new("systemctl")
-        .args(["--user", "disable", "--now", "rustplayer.service"])
-        .status();
+    for unit_name in [STARTUP_UNIT_NAME, LEGACY_STARTUP_UNIT_NAME] {
+        let _ = ProcessCommand::new("systemctl")
+            .args(["--user", "disable", "--now", unit_name])
+            .status();
+    }
     if let Some(config_dir) = dirs::config_dir() {
-        let unit_path = config_dir
-            .join("systemd")
-            .join("user")
-            .join("rustplayer.service");
-        if unit_path.exists() {
-            fs::remove_file(unit_path)?;
+        let unit_dir = config_dir.join("systemd").join("user");
+        for unit_name in [STARTUP_UNIT_NAME, LEGACY_STARTUP_UNIT_NAME] {
+            let unit_path = unit_dir.join(unit_name);
+            if unit_path.exists() {
+                fs::remove_file(unit_path)?;
+            }
         }
     }
     let _ = ProcessCommand::new("systemctl")

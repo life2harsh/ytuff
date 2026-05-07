@@ -936,7 +936,7 @@ impl YouTubeClient {
             return Ok(None);
         }
 
-        let path = std::env::temp_dir().join(format!("rustplayer-ytdlp-{}.cookies", now()));
+        let path = std::env::temp_dir().join(format!("ytuff-ytdlp-{}.cookies", now()));
         let mut out = String::from("# Netscape HTTP Cookie File\n");
 
         for (name, value) in cookie_map {
@@ -2390,8 +2390,8 @@ fn explain_playability_reason(reason: String, authenticated: bool) -> String {
 
     format!(
         "{reason}. YouTube is blocking guest playback. Import YouTube browser headers with \
-         'rustplayer auth headers-file headers.json'. On Windows, Chromium browser cookies may \
-         also require running RustPlayer as Administrator before they can be reused automatically."
+         'ytuff auth headers-file headers.json'. On Windows, Chromium browser cookies may \
+         also require running YTuff as Administrator before they can be reused automatically."
     )
 }
 

@@ -35,6 +35,9 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
 };
 
+const APP_DIR_NAME: &str = "ytuff";
+const LEGACY_APP_DIR_NAME: &str = "rustplayer";
+
 #[derive(Clone, Debug)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
@@ -48,14 +51,13 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn discover() -> Self {
-        let mut config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-        config_dir.push("rustplayer");
+        let config_root = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        let data_root = dirs::data_local_dir().unwrap_or_else(|| config_root.clone());
+        let cache_root = dirs::cache_dir().unwrap_or_else(|| data_root.clone());
 
-        let mut data_dir = dirs::data_local_dir().unwrap_or_else(|| config_dir.clone());
-        data_dir.push("rustplayer");
-
-        let mut cache_dir = dirs::cache_dir().unwrap_or_else(|| data_dir.clone());
-        cache_dir.push("rustplayer");
+        let config_dir = preferred_app_dir(config_root);
+        let data_dir = preferred_app_dir(data_root);
+        let cache_dir = preferred_app_dir(cache_root);
 
         let mut config_file = config_dir.clone();
         config_file.push("config.json");
@@ -93,6 +95,20 @@ impl AppPaths {
         }
         Ok(())
     }
+}
+
+fn preferred_app_dir(base: PathBuf) -> PathBuf {
+    let dir = base.join(APP_DIR_NAME);
+    if dir.exists() {
+        return dir;
+    }
+
+    let legacy_dir = base.join(LEGACY_APP_DIR_NAME);
+    if legacy_dir.exists() {
+        return legacy_dir;
+    }
+
+    dir
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -367,7 +383,7 @@ fn query_chromium_cookies(db_path: &Path) -> Option<Vec<ChromiumCookieRow>> {
     let script = r#"
 import base64, json, os, shutil, sqlite3, sys, tempfile
 src = sys.argv[1]
-with tempfile.TemporaryDirectory(prefix="rustplayer-cookies-") as tmp:
+with tempfile.TemporaryDirectory(prefix="ytuff-cookies-") as tmp:
     dst = os.path.join(tmp, "Cookies")
     shutil.copy2(src, dst)
     for suffix in ("-wal", "-shm"):

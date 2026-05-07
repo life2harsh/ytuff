@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=YTuff
+GenericName=Terminal Music Player
+Comment=Terminal music player for local files and YouTube Music
+Exec=ytuff tui
+Terminal=true
+Categories=AudioVideo;Audio;Player;
+Keywords=music;youtube;terminal;tui;
+StartupNotify=false

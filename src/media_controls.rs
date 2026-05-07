@@ -55,8 +55,8 @@ impl MediaSession {
             let window = HiddenWindow::new()?;
 
             let mut controls = MediaControls::new(PlatformConfig {
-                dbus_name: "rustplayer",
-                display_name: "RustPlayer",
+                dbus_name: "ytuff",
+                display_name: "YTuff",
                 #[cfg(target_os = "windows")]
                 hwnd: Some(window.hwnd()),
                 #[cfg(not(target_os = "windows"))]
@@ -257,7 +257,7 @@ fn run_hidden_window(ready_tx: Sender<Result<(usize, u32)>>) {
         }
 
         let class_name = wide("STATIC");
-        let title = wide("RustPlayer Media Controls");
+        let title = wide("YTuff Media Controls");
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),

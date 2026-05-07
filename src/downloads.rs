@@ -116,7 +116,7 @@ fn temp_source_path(ext: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    path.push(format!("rustplayer-dl-{stamp}.{ext}"));
+    path.push(format!("ytuff-dl-{stamp}.{ext}"));
     path
 }
 
