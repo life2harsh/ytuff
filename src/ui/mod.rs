@@ -2715,7 +2715,14 @@ fn trim(v: &str, n: usize) -> String {
     if v.len() <= n {
         v.to_string()
     } else {
-        format!("{}...", &v[..n.saturating_sub(3)])
+        let keep = n.saturating_sub(3);
+        let cut = v
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .take_while(|idx| *idx <= keep)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &v[..cut])
     }
 }
 
@@ -2765,4 +2772,17 @@ fn centered(r: Rect, px: u16, py: u16) -> Rect {
             Constraint::Percentage((100 - px) / 2),
         ])
         .split(v[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim;
+
+    #[test]
+    fn trim_handles_unicode_boundaries() {
+        let title = "Tere Mere Hothon Pe – Lyrical | तेरे मेरे होठों पे";
+        let trimmed = trim(title, 54);
+        assert!(trimmed.ends_with("..."));
+        assert!(trimmed.is_char_boundary(trimmed.len()));
+    }
 }

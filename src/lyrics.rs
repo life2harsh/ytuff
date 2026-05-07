@@ -49,7 +49,11 @@ impl LyricsClient {
     pub fn new(paths: AppPaths) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(20))
-            .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
             .build()
             .unwrap_or_else(|_| Client::new());
         Self { http, paths }

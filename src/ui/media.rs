@@ -525,10 +525,15 @@ fn enc_blocks(img: DynamicImage, rect: Rect) -> Vec<u8> {
 
 fn enc_wimg(img: DynamicImage, rect: Rect) -> Result<Vec<u8>> {
     let rgb = fit_to_canvas(img, rect);
+    let (w, h) = rgb.dimensions();
     let path = temp_wimg_path();
     image::DynamicImage::ImageRgb8(rgb).save(&path)?;
 
+    // wimg normally sizes itself to the whole terminal. Pin it to the live
+    // artwork pane so resizes do not overflow into the rest of the UI.
     let output = Command::new(wimg_command())
+        .env("WIMG_MAX_PX_W", w.to_string())
+        .env("WIMG_MAX_PX_H", h.to_string())
         .arg(&path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1026,10 +1031,7 @@ fn temp_wimg_path() -> std::path::PathBuf {
         .unwrap_or_default()
         .as_millis();
     let mut path = std::env::temp_dir();
-    path.push(format!(
-        "ytuff-wimg-{}-{stamp}.png",
-        std::process::id()
-    ));
+    path.push(format!("ytuff-wimg-{}-{stamp}.png", std::process::id()));
     path
 }
 
