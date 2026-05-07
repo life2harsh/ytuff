@@ -69,6 +69,11 @@ $source = Join-Path $repo "target\release"
 $dist = Join-Path $repo "dist\ytuff-windows-x64"
 $zip = Join-Path $repo "dist\ytuff-windows-x64.zip"
 $ffmpegDir = "C:\path\to\ffmpeg\bin"
+$webview2Loader = Get-ChildItem -Path (Join-Path $repo "target\release\build") `
+  -Recurse -Filter "WebView2Loader.dll" -ErrorAction SilentlyContinue |
+  Where-Object { $_.FullName -like "*\out\x64\WebView2Loader.dll" } |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
 
 cargo run --release -- shutdown 2>$null
 taskkill /IM ytuff.exe /F 2>$null
@@ -105,6 +110,11 @@ foreach ($file in @("ffmpeg.exe", "ffprobe.exe")) {
   }
   Copy-Item $src $dist -Force
 }
+
+if ($null -eq $webview2Loader) {
+  throw "Missing WebView2Loader.dll in target\\release\\build"
+}
+Copy-Item $webview2Loader.FullName $dist -Force
 
 @'
 $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -188,6 +198,7 @@ ytuff.exe
 wimg.exe
 ffmpeg.exe
 ffprobe.exe
+WebView2Loader.dll
 libgcc_s_seh-1.dll
 libjpeg-8.dll
 libpng16-16.dll
@@ -200,6 +211,7 @@ README.txt
 ```
 
 Do not zip `target\release` directly. It contains Cargo build folders and temporary files.
+The packaged Windows build must include `WebView2Loader.dll` beside `ytuff.exe` or the app will fail to start on systems that do not already have that loader on PATH.
 
 ## Build a Linux release tarball on Arch using fish
 

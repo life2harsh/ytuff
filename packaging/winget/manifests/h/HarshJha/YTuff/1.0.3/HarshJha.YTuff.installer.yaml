@@ -11,6 +11,6 @@ ReleaseDate: 2026-05-07
 Installers:
   - Architecture: x64
     InstallerUrl: https://github.com/life2harsh/ytuff/releases/download/v1.0.3/ytuff-windows-x64.zip
-    InstallerSha256: 061BFAF2CF7B8FB9F5FBBD94DD0CBD9BFE4654AA1E6BC1C1F57EE0DA52E56EE9
+    InstallerSha256: 1CE4B09BCABE2C68993260424CDED0522B951500C1AE98B4914328914F9A6A32
 ManifestType: installer
 ManifestVersion: 1.12.0

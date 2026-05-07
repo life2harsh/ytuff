@@ -26,9 +26,23 @@ if (Test-Path $stripExe) {
 Write-Host "[4/5] Creating distribution..." -ForegroundColor Green
 $distDir = "dist\ytuff-windows-x86_64"
 New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+$releaseDir = "target\x86_64-pc-windows-msvc\release"
 
 # Copy main binary
-Copy-Item "target\x86_64-pc-windows-msvc\release\ytuff.exe" "$distDir\"
+Copy-Item "$releaseDir\ytuff.exe" "$distDir\"
+
+# Copy WebView2 loader for embedded YouTube login on Windows
+$webview2Loader = Get-ChildItem -Path "target\x86_64-pc-windows-msvc\release\build" `
+    -Recurse -Filter "WebView2Loader.dll" -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -like "*\out\x64\WebView2Loader.dll" } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+
+if ($null -eq $webview2Loader) {
+    Write-Host "WARNING: WebView2Loader.dll not found, YouTube login will fail on Windows" -ForegroundColor Red
+} else {
+    Copy-Item $webview2Loader.FullName "$distDir\" -Force
+}
 
 # Copy wimg and dependencies
 Write-Host "Adding wimg for image rendering..." -ForegroundColor Yellow

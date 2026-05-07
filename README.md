@@ -65,6 +65,7 @@ ytuff.exe
 wimg.exe
 ffmpeg.exe
 ffprobe.exe
+WebView2Loader.dll
 libgcc_s_seh-1.dll
 libjpeg-8.dll
 libpng16-16.dll
@@ -651,5 +652,5 @@ ytuff auth headers-file headers.json
 
 ### The Windows zip works on your machine but not on another PC
 
-You probably forgot the `wimg` DLLs or FFmpeg files. Ship the full Windows file set listed above.
+You probably forgot the `wimg` DLLs, `WebView2Loader.dll`, or the FFmpeg files. Ship the full Windows file set listed above.
 
