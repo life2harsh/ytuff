@@ -25,7 +25,7 @@ previously named rustplayer, because made in rust and music player, but since th
 * Tray support on Windows
 * FFmpeg backed streaming and local playback fallback
 
-## Development and comtributing
+## Development and contributing
 Build, packaging, release, repo layout, and development notes live in [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Screenshots
