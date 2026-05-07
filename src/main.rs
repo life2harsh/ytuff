@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use url::Url;
 
 #[cfg(target_os = "windows")]
@@ -1158,14 +1159,14 @@ fn shell_escape_arg(value: &str) -> String {
 
 fn maybe_restart_daemon(runtime: &Runtime) -> Result<()> {
     if send_request(&runtime.cfg.daemon_addr, &RpcRequest::Ping).is_ok() {
-        let _ = send_request(&runtime.cfg.daemon_addr, &RpcRequest::Shutdown);
+        let _ = daemon::shutdown_and_wait(&runtime.cfg.daemon_addr, Duration::from_secs(3));
     }
     Ok(())
 }
 
 fn shutdown_daemon(runtime: &Runtime) -> Result<()> {
-    match send_request(&runtime.cfg.daemon_addr, &RpcRequest::Shutdown) {
-        Ok(_) => {
+    match daemon::shutdown_and_wait(&runtime.cfg.daemon_addr, Duration::from_secs(3)) {
+        Ok(()) => {
             println!("daemon stopped");
             Ok(())
         }

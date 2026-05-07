@@ -225,6 +225,29 @@ pub fn ensure_daemon(paths: &AppPaths) -> Result<()> {
     Err(anyhow!("Daemon did not become ready in time"))
 }
 
+pub fn shutdown_and_wait(addr: &str, timeout: Duration) -> Result<()> {
+    match send_request(addr, &RpcRequest::Shutdown) {
+        Ok(_) => {}
+        Err(err) => {
+            if send_request(addr, &RpcRequest::Ping).is_err() {
+                return Ok(());
+            }
+            return Err(err);
+        }
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if send_request(addr, &RpcRequest::Ping).is_err() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!("Daemon did not stop in time"));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn handle_client(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<bool> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;

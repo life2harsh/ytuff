@@ -895,7 +895,7 @@ pub fn run_ui(
         }
     });
 
-    let sc = start_sc(sc_cli, playback_sc_cli, paths, cfg);
+    let sc = start_sc(sc_cli, playback_sc_cli, paths, cfg.clone());
     let mut app = App::new(core, pb, sc);
     let _ = app.sc.tx.send(ScReq::Init);
     let _ = app.pb.tx.send(PlaybackCommand::ListDevices);
@@ -1060,10 +1060,10 @@ pub fn run_ui(
                                 app.show_dev = false;
                                 app.img.mark();
                             }
-                            KeyCode::Char('q') => {
-                                let _ = app.pb.tx.send(PlaybackCommand::Quit);
-                                break 'ui true;
-                            }
+                            KeyCode::Char('q') => match shutdown_daemon_from_cfg(&cfg) {
+                                Ok(()) => break 'ui true,
+                                Err(err) => app.note(err),
+                            },
                             KeyCode::Char('j') | KeyCode::Down => app.next_dev(),
                             KeyCode::Char('k') | KeyCode::Up => app.prev_dev(),
                             KeyCode::Enter => {
@@ -1090,10 +1090,10 @@ pub fn run_ui(
                                 app.show_fld = false;
                                 app.img.mark();
                             }
-                            KeyCode::Char('q') => {
-                                let _ = app.pb.tx.send(PlaybackCommand::Quit);
-                                break 'ui true;
-                            }
+                            KeyCode::Char('q') => match shutdown_daemon_from_cfg(&cfg) {
+                                Ok(()) => break 'ui true,
+                                Err(err) => app.note(err),
+                            },
                             KeyCode::Char('j') | KeyCode::Down => app.next_fld(),
                             KeyCode::Char('k') | KeyCode::Up => app.prev_fld(),
                             KeyCode::Char('d') => {
@@ -1130,10 +1130,10 @@ pub fn run_ui(
                                 app.show_lyrics = false;
                                 app.img.mark();
                             }
-                            KeyCode::Char('q') => {
-                                let _ = app.pb.tx.send(PlaybackCommand::Quit);
-                                break 'ui true;
-                            }
+                            KeyCode::Char('q') => match shutdown_daemon_from_cfg(&cfg) {
+                                Ok(()) => break 'ui true,
+                                Err(err) => app.note(err),
+                            },
                             _ => {}
                         }
                         continue;
@@ -1167,10 +1167,10 @@ pub fn run_ui(
                     }
 
                     match key.code {
-                        KeyCode::Char('q') => {
-                            let _ = app.pb.tx.send(PlaybackCommand::Quit);
-                            break 'ui true;
-                        }
+                        KeyCode::Char('q') => match shutdown_daemon_from_cfg(&cfg) {
+                            Ok(()) => break 'ui true,
+                            Err(err) => app.note(err),
+                        },
                         KeyCode::Char('s') => app.toggle_mode(),
                         KeyCode::Char('?') | KeyCode::Char('h') => {
                             app.show_help = true;
@@ -1352,6 +1352,11 @@ fn clear_terminal_screen() -> io::Result<()> {
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
         crossterm::cursor::MoveTo(0, 0)
     )
+}
+
+fn shutdown_daemon_from_cfg(cfg: &Arc<Mutex<AppConfig>>) -> Result<(), String> {
+    let addr = cfg.lock().unwrap().daemon_addr.clone();
+    crate::daemon::shutdown_and_wait(&addr, Duration::from_secs(3)).map_err(|err| err.to_string())
 }
 
 fn apply_auth_session(
