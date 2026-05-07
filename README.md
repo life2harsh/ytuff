@@ -48,6 +48,8 @@ Local library + YouTube Music + queue + artwork
 
 ### Windows
 
+Winget: Coming soon
+
 Download the latest Windows release zip from Releases.
 
 Extract it and run:
@@ -89,6 +91,15 @@ ytuff tui
 ```
 
 ### Linux
+
+Arch User Repository(AUR)
+```bash
+yay -S ytuff-bin
+yay -S ytuff
+```
+links to the packages: 
+<https://aur.archlinux.org/packages/ytuff-bin>
+<https://aur.archlinux.org/packages/ytuff>
 
 Download the Linux tarball, extract it, and run:
 
