@@ -48,17 +48,21 @@ Local library + YouTube Music + queue + artwork
 
 ### Windows
 
-Winget: Coming soon
+Winget: pending the MSI submission for `HarshJha.YTuff`.
 
-Download the latest Windows release zip from Releases.
-
-Extract it and run:
+Download the latest Windows installer from Releases:
 
 ```powershell
-.\ytuff.exe tui
+ytuff-windows-x64.msi
 ```
 
-The Windows release is portable. It should include:
+Or, if you want the portable build:
+
+```powershell
+ytuff-windows-x64.zip
+```
+
+The portable Windows release should include:
 
 ```text
 ytuff.exe
@@ -75,11 +79,14 @@ zlib1.dll
 install-user.bat
 install-user.ps1
 README.txt
+LICENSE
 ```
 
-Do not delete the DLL files. They are required by the bundled `wimg.exe` renderer.
+The MSI installs everything into `Program Files\YTuff`, adds that folder to `PATH`, and registers uninstall support.
 
-To make `ytuff` available from any terminal, run:
+For the portable zip, do not delete the DLL files. They are required by the bundled `wimg.exe` renderer.
+
+To make the portable zip available from any terminal, run:
 
 ```powershell
 .\install-user.bat

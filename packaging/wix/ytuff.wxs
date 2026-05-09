@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+    Id="*"
+    Name="YTuff"
+    Language="1033"
+    Version="$(var.ProductVersion)"
+    Manufacturer="Harsh Jha"
+    UpgradeCode="A1A9D65A-2539-49EC-BFA2-6B06366E5E5D">
+    <Package
+      InstallerVersion="500"
+      Compressed="yes"
+      InstallScope="perMachine"
+      Platform="x64" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/life2harsh/ytuff" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/life2harsh/ytuff/releases" />
+    <Property Id="ARPCONTACT" Value="jhaharsh29@gmail.com" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="YTuff" />
+      </Directory>
+      <Directory Id="CommonProgramsFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="YTuff" />
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="CoreFiles" Guid="8DF4F0F3-EC1B-4270-9D0F-7EB111A6FAAF" Win64="yes">
+        <File Id="FileYtuffExe" Source="$(var.StageDir)\ytuff.exe" KeyPath="yes" />
+        <File Id="FileWebView2Loader" Source="$(var.StageDir)\WebView2Loader.dll" />
+        <File Id="FileWimgExe" Source="$(var.StageDir)\wimg.exe" />
+        <File Id="FileLibGcc" Source="$(var.StageDir)\libgcc_s_seh-1.dll" />
+        <File Id="FileLibJpeg" Source="$(var.StageDir)\libjpeg-8.dll" />
+        <File Id="FileLibPng" Source="$(var.StageDir)\libpng16-16.dll" />
+        <File Id="FileLibSixel" Source="$(var.StageDir)\libsixel-1.dll" />
+        <File Id="FileLibWinPthread" Source="$(var.StageDir)\libwinpthread-1.dll" />
+        <File Id="FileZlib" Source="$(var.StageDir)\zlib1.dll" />
+        <File Id="FileFfmpeg" Source="$(var.StageDir)\ffmpeg.exe" />
+        <File Id="FileFfprobe" Source="$(var.StageDir)\ffprobe.exe" />
+        <File Id="FileInstallUserPs1" Source="$(var.StageDir)\install-user.ps1" />
+        <File Id="FileInstallUserBat" Source="$(var.StageDir)\install-user.bat" />
+        <File Id="FileReadmeTxt" Source="$(var.StageDir)\README.txt" />
+        <File Id="FileLicense" Source="$(var.StageDir)\LICENSE" />
+        <Environment
+          Id="AddInstallDirToMachinePath"
+          Name="PATH"
+          Value="[INSTALLFOLDER]"
+          Permanent="no"
+          Part="last"
+          Action="set"
+          System="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="StartMenuShortcut" Guid="A82D3216-44DA-4918-85FD-55C928756CD6" Win64="yes">
+        <Shortcut
+          Id="StartMenuShortcutYTuff"
+          Name="YTuff"
+          Description="Terminal music player for local files and YouTube Music"
+          Target="[INSTALLFOLDER]ytuff.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\HarshJha\YTuff"
+          Name="Installed"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="ProductFeature" Title="YTuff" Level="1">
+      <ComponentRef Id="CoreFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Product>
+</Wix>

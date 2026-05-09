@@ -55,143 +55,33 @@ sudo apt update
 sudo apt install build-essential pkg-config curl ca-certificates libssl-dev libasound2-dev libudev-dev libgtk-3-dev libwebkit2gtk-4.1-dev ffmpeg
 ```
 
-## Build a Windows release zip
+## Build Windows release artifacts
 
 Run this in PowerShell from the repository root.
 
-It builds YTuff, creates a clean release folder, copies the bundled `wimg` runtime files, copies FFmpeg, creates PATH installer scripts, and zips the result.
+The release scripts now build one verified Windows payload and fail if any required runtime file is missing, including `WebView2Loader.dll`, `wimg.exe`, the `wimg` DLLs, `ffmpeg.exe`, and `ffprobe.exe`.
 
 ```powershell
-cd path\to\ytuff
-
-$repo = (Get-Location).Path
-$source = Join-Path $repo "target\release"
-$dist = Join-Path $repo "dist\ytuff-windows-x64"
-$zip = Join-Path $repo "dist\ytuff-windows-x64.zip"
-$ffmpegDir = "C:\path\to\ffmpeg\bin"
-$webview2Loader = Get-ChildItem -Path (Join-Path $repo "target\release\build") `
-  -Recurse -Filter "WebView2Loader.dll" -ErrorAction SilentlyContinue |
-  Where-Object { $_.FullName -like "*\out\x64\WebView2Loader.dll" } |
-  Sort-Object LastWriteTime -Descending |
-  Select-Object -First 1
-
-cargo run --release -- shutdown 2>$null
-taskkill /IM ytuff.exe /F 2>$null
-
-cargo build --release
-if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
-
-Remove-Item $dist -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force $dist | Out-Null
-
-$requiredSourceFiles = @(
-  "ytuff.exe",
-  "wimg.exe",
-  "libgcc_s_seh-1.dll",
-  "libjpeg-8.dll",
-  "libpng16-16.dll",
-  "libsixel-1.dll",
-  "libwinpthread-1.dll",
-  "zlib1.dll"
-)
-
-foreach ($file in $requiredSourceFiles) {
-  $src = Join-Path $source $file
-  if (-not (Test-Path $src)) {
-    throw "Missing required file: $src"
-  }
-  Copy-Item $src $dist -Force
-}
-
-foreach ($file in @("ffmpeg.exe", "ffprobe.exe")) {
-  $src = Join-Path $ffmpegDir $file
-  if (-not (Test-Path $src)) {
-    throw "Missing FFmpeg file: $src"
-  }
-  Copy-Item $src $dist -Force
-}
-
-if ($null -eq $webview2Loader) {
-  throw "Missing WebView2Loader.dll in target\\release\\build"
-}
-Copy-Item $webview2Loader.FullName $dist -Force
-
-@'
-$AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-
-$parts = @()
-if (-not [string]::IsNullOrWhiteSpace($UserPath)) {
-    $parts = $UserPath -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-}
-
-$alreadyInstalled = $false
-foreach ($part in $parts) {
-    if ($part.TrimEnd("\") -ieq $AppDir.TrimEnd("\")) {
-        $alreadyInstalled = $true
-        break
-    }
-}
-
-if ($alreadyInstalled) {
-    Write-Host "YTuff is already in your user PATH."
-} else {
-    $newParts = @($parts + $AppDir)
-    $newPath = ($newParts | Select-Object -Unique) -join ";"
-    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-    Write-Host "YTuff was added to your user PATH."
-}
-
-Write-Host ""
-Write-Host "Restart your terminal, then run:"
-Write-Host "  ytuff tui"
-Write-Host ""
-Read-Host "Press Enter to close"
-'@ | Set-Content -Path "$dist\install-user.ps1" -Encoding UTF8
-
-@'
-@echo off
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install-user.ps1"
-'@ | Set-Content -Path "$dist\install-user.bat" -Encoding ASCII
-
-@'
-YTuff Windows x64
-
-Run:
-  ytuff.exe tui
-
-To install ytuff into your user PATH:
-  Double-click install-user.bat
-
-After installing:
-  Restart your terminal
-  Run: ytuff tui
-
-Do not delete these files:
-  wimg.exe
-  ffmpeg.exe
-  ffprobe.exe
-  *.dll
-'@ | Set-Content -Path "$dist\README.txt" -Encoding UTF8
-
-Remove-Item $zip -Force -ErrorAction SilentlyContinue
-Compress-Archive -Path "$dist\*" -DestinationPath $zip -Force
-
-Write-Host "Release folder: $dist"
-Write-Host "Release zip: $zip"
-Get-ChildItem $dist
+.\scripts\build-windows.ps1
+.\scripts\build-windows-msi.ps1 -NoClean
 ```
 
-Test the packaged Windows build:
+Optional environment overrides:
 
 ```powershell
-cd .\dist\ytuff-windows-x64
-Remove-Item Env:YTUFF_WIMG -ErrorAction SilentlyContinue
-$env:YTUFF_ART="wimg"
-.\ytuff.exe tui
+$env:YTUFF_WIMG_DIR="H:\path\to\wimg\build_wimg"
+$env:YTUFF_FFMPEG_DIR="C:\path\to\ffmpeg\bin"
 ```
 
-A clean Windows release folder should contain:
+Outputs:
+
+```text
+dist\ytuff-windows-x64\
+dist\ytuff-windows-x64.zip
+dist\ytuff-windows-x64.msi
+```
+
+The staged Windows payload should contain:
 
 ```text
 ytuff.exe
@@ -208,10 +98,19 @@ zlib1.dll
 install-user.bat
 install-user.ps1
 README.txt
+LICENSE
 ```
 
-Do not zip `target\release` directly. It contains Cargo build folders and temporary files.
-The packaged Windows build must include `WebView2Loader.dll` beside `ytuff.exe` or the app will fail to start on systems that do not already have that loader on PATH.
+Test the portable package:
+
+```powershell
+cd .\dist\ytuff-windows-x64
+Remove-Item Env:YTUFF_WIMG -ErrorAction SilentlyContinue
+$env:YTUFF_ART="wimg"
+.\ytuff.exe tui
+```
+
+The MSI installs the same runtime payload under `Program Files\YTuff`, adds that folder to `PATH`, and registers uninstall support.
 
 ## Build a Linux release tarball on Arch using fish
 
