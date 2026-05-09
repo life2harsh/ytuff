@@ -1916,6 +1916,7 @@ struct AudioChoice {
 
 fn pick_audio_stream(player: &Value, ql: Ql) -> Option<AudioChoice> {
     let mut preferred_mp4 = Vec::new();
+    let mut he_aac_mp4 = Vec::new();
     let mut mp4_fallback = Vec::new();
     let mut fallback = Vec::new();
 
@@ -1958,10 +1959,10 @@ fn pick_audio_stream(player: &Value, ql: Ql) -> Option<AudioChoice> {
             bitrate,
         };
 
-        if mime.starts_with("audio/mp4")
-            && (mime.contains("mp4a.40.2") || mime.contains("mp4a.40.5"))
-        {
+        if mime.starts_with("audio/mp4") && mime.contains("mp4a.40.2") {
             preferred_mp4.push(choice);
+        } else if mime.starts_with("audio/mp4") && mime.contains("mp4a.40.5") {
+            he_aac_mp4.push(choice);
         } else if mime.starts_with("audio/mp4") || mime.contains("codecs=\"opus\"") {
             mp4_fallback.push(choice);
         } else {
@@ -1971,6 +1972,8 @@ fn pick_audio_stream(player: &Value, ql: Ql) -> Option<AudioChoice> {
 
     let mut candidates = if !preferred_mp4.is_empty() {
         preferred_mp4
+    } else if !he_aac_mp4.is_empty() {
+        he_aac_mp4
     } else if !mp4_fallback.is_empty() {
         mp4_fallback
     } else {
@@ -2543,6 +2546,32 @@ mod tests {
         assert_eq!(
             pick_audio_stream(&player, Ql::High).unwrap().url,
             "https://example.com/c?expire=10"
+        );
+    }
+
+    #[test]
+    fn quality_falls_back_to_he_aac_when_needed() {
+        let player = json!({
+            "streamingData": {
+                "adaptiveFormats": [
+                    { "mimeType": "audio/mp4; codecs=\"mp4a.40.5\"", "url": "https://example.com/a?expire=10", "bitrate": 50000 },
+                    { "mimeType": "audio/mp4; codecs=\"mp4a.40.5\"", "url": "https://example.com/b?expire=10", "bitrate": 96000 },
+                    { "mimeType": "audio/webm; codecs=\"opus\"", "url": "https://example.com/c?expire=10", "bitrate": 128000 }
+                ]
+            }
+        });
+
+        assert_eq!(
+            pick_audio_stream(&player, Ql::Low).unwrap().url,
+            "https://example.com/a?expire=10"
+        );
+        assert_eq!(
+            pick_audio_stream(&player, Ql::Med).unwrap().url,
+            "https://example.com/b?expire=10"
+        );
+        assert_eq!(
+            pick_audio_stream(&player, Ql::High).unwrap().url,
+            "https://example.com/b?expire=10"
         );
     }
 

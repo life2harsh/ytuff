@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const RPC_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RpcRequest {
@@ -159,9 +161,10 @@ pub fn run_daemon(paths: AppPaths, config: AppConfig) -> Result<()> {
     while !state.shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
-                if !handle_client(stream, &state)? {
-                    break;
-                }
+                let state = state.clone();
+                thread::spawn(move || {
+                    let _ = handle_client(stream, &state);
+                });
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));
@@ -179,12 +182,23 @@ pub fn send_request(addr: &str, request: &RpcRequest) -> Result<RpcResponse> {
     stream
         .set_nodelay(true)
         .context("Could not enable TCP_NODELAY")?;
+    stream
+        .set_read_timeout(Some(RPC_IO_TIMEOUT))
+        .context("Could not set RPC read timeout")?;
+    stream
+        .set_write_timeout(Some(RPC_IO_TIMEOUT))
+        .context("Could not set RPC write timeout")?;
     stream.write_all(serde_json::to_string(request)?.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
 
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
+    let bytes = BufReader::new(stream).read_line(&mut line)?;
+    if bytes == 0 || line.trim().is_empty() {
+        return Err(anyhow!(
+            "Daemon closed the connection without sending a response"
+        ));
+    }
     let response = serde_json::from_str::<RpcResponse>(&line)?;
     if response.ok {
         Ok(response)
@@ -248,12 +262,34 @@ pub fn shutdown_and_wait(addr: &str, timeout: Duration) -> Result<()> {
     }
 }
 
-fn handle_client(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<bool> {
-    let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-    let request = serde_json::from_str::<RpcRequest>(&line)?;
+fn handle_client(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<()> {
+    stream
+        .set_read_timeout(Some(RPC_IO_TIMEOUT))
+        .context("Could not set client read timeout")?;
+    stream
+        .set_write_timeout(Some(RPC_IO_TIMEOUT))
+        .context("Could not set client write timeout")?;
 
-    let keep_running = !matches!(&request, RpcRequest::Shutdown);
+    let mut line = String::new();
+    match BufReader::new(stream.try_clone()?).read_line(&mut line) {
+        Ok(0) => return Ok(()),
+        Ok(_) => {}
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    }
+
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+
+    let request = serde_json::from_str::<RpcRequest>(&line)?;
     let mut response = match apply_request(request.clone(), state) {
         Ok(message) => RpcResponse {
             ok: true,
@@ -276,7 +312,7 @@ fn handle_client(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<bool
     stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
-    Ok(keep_running)
+    Ok(())
 }
 
 fn apply_request(request: RpcRequest, state: &Arc<SharedState>) -> Result<String> {

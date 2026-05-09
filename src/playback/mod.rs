@@ -41,6 +41,8 @@ const FFMPEG_START_TIMEOUT: Duration = Duration::from_secs(10);
 const FFMPEG_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
 const FFMPEG_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const FFMPEG_BUFFER_CHUNKS: usize = 32;
+const PLAYBACK_FINISH_DEBOUNCE: Duration = Duration::from_millis(500);
+const OUTPUT_DEVICE_MISSING_GRACE: Duration = Duration::from_secs(2);
 
 #[allow(dead_code)]
 pub enum PlaybackCommand {
@@ -1799,6 +1801,56 @@ fn maybe_seed_autoplay_queue(
     });
 }
 
+fn playback_completion_confirmed(
+    sink_empty: bool,
+    current_pos: u64,
+    current_duration: u64,
+    empty_since: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
+    if !sink_empty {
+        *empty_since = None;
+        return false;
+    }
+
+    let first_empty_at = *empty_since.get_or_insert(now);
+    let near_track_end = current_duration > 0 && current_pos.saturating_add(1) >= current_duration;
+    near_track_end || now.duration_since(first_empty_at) >= PLAYBACK_FINISH_DEBOUNCE
+}
+
+fn has_restore_target(
+    current_track_id: &Option<String>,
+    current_file_path: &Option<String>,
+) -> bool {
+    current_track_id.is_some() || current_file_path.is_some()
+}
+
+fn output_recovery_needed(
+    has_stream_handle: bool,
+    current_device_name: Option<&str>,
+    available_devices: &[String],
+    device_missing_since: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
+    if !has_stream_handle || current_device_name.is_none() {
+        *device_missing_since = None;
+        return true;
+    }
+
+    let current_device_name = current_device_name.unwrap();
+    let current_device_available = available_devices
+        .iter()
+        .any(|device| device == current_device_name);
+
+    if current_device_available {
+        *device_missing_since = None;
+        return false;
+    }
+
+    let first_missing_at = *device_missing_since.get_or_insert(now);
+    now.duration_since(first_missing_at) >= OUTPUT_DEVICE_MISSING_GRACE
+}
+
 pub fn start_audio_thread(
     core: Core,
     sc_client: Arc<Mutex<SoundCloudClient>>,
@@ -1846,6 +1898,8 @@ pub fn start_audio_thread(
         let mut preparing_track_id: Option<String> = None;
         let mut waiting_for_output_recovery = stream_handle.is_none();
         let mut last_device_check = Instant::now();
+        let mut empty_sink_since = None::<Instant>;
+        let mut missing_device_since = None::<Instant>;
 
         let fft_processor = Arc::new(Mutex::new(FftProcessor::new(2048)));
         let visualizer_enabled = Arc::new(Mutex::new(false));
@@ -1881,10 +1935,18 @@ pub fn start_audio_thread(
             if current_duration > 0 {
                 current_pos = current_pos.min(current_duration);
             }
-            let playback_finished = sink
+            let loop_now = Instant::now();
+            let sink_empty = sink
                 .as_ref()
                 .map(|s| !s.is_paused() && s.empty())
                 .unwrap_or(false);
+            let mut playback_finished = playback_completion_confirmed(
+                sink_empty,
+                current_pos,
+                current_duration,
+                &mut empty_sink_since,
+                loop_now,
+            );
             let is_playing = sink
                 .as_ref()
                 .map(|s| !s.is_paused() && !s.empty())
@@ -1903,23 +1965,25 @@ pub fn start_audio_thread(
                 last_device_check = Instant::now();
 
                 let available_devices = list_output_device_names(&host);
-                let current_device_available = current_device_name
-                    .as_ref()
-                    .is_some_and(|name| available_devices.iter().any(|device| device == name));
-                let needs_output_recovery = stream_handle.is_none()
-                    || current_device_name.is_none()
-                    || !current_device_available;
+                let needs_output_recovery = output_recovery_needed(
+                    stream_handle.is_some(),
+                    current_device_name.as_deref(),
+                    &available_devices,
+                    &mut missing_device_since,
+                    loop_now,
+                );
 
                 if needs_output_recovery {
+                    playback_finished = false;
                     let previous_device_name = current_device_name.clone();
                     let saved_track_id = current_track_id.clone();
                     let saved_file_path = current_file_path.clone();
                     let saved_position = current_pos;
                     let was_playing = !is_paused
                         && (sink.is_some()
-                            || saved_track_id.is_some()
-                            || saved_file_path.is_some());
+                            || has_restore_target(&saved_track_id, &saved_file_path));
 
+                    preparing_track_id = None;
                     sink = None;
                     _stream = None;
                     stream_handle = None;
@@ -2034,7 +2098,20 @@ pub fn start_audio_thread(
                                 shuffle_enabled = false;
                                 shuffle_tx.send(false).ok();
                             }
+                            preparing_track_id = None;
+                            current_track_id = Some(track.id.clone());
+                            current_file_path = track
+                                .path
+                                .clone()
+                                .map(|path| path.to_string_lossy().to_string());
+                            current_duration = track.dur.unwrap_or(0);
+                            core.set_cur(Some(track.id.clone()));
+                            is_paused = false;
+                            elapsed_before_pause = 0;
+                            playback_start = None;
+                            last_finished_track_id = None;
                             let Some(handle) = stream_handle.as_ref() else {
+                                sink = None;
                                 msg_tx
                                     .send(
                                         "No audio output available; waiting for another device"
@@ -2089,7 +2166,20 @@ pub fn start_audio_thread(
                                 shuffle_enabled = false;
                                 shuffle_tx.send(false).ok();
                             }
+                            preparing_track_id = None;
+                            current_track_id = Some(id.clone());
+                            current_file_path = track
+                                .path
+                                .clone()
+                                .map(|path| path.to_string_lossy().to_string());
+                            current_duration = track.dur.unwrap_or(0);
+                            core.set_cur(Some(id.clone()));
+                            is_paused = false;
+                            elapsed_before_pause = 0;
+                            playback_start = None;
+                            last_finished_track_id = None;
                             let Some(handle) = stream_handle.as_ref() else {
+                                sink = None;
                                 msg_tx
                                     .send(
                                         "No audio output available; waiting for another device"
@@ -2199,12 +2289,17 @@ pub fn start_audio_thread(
                         tx_clone.send(PlaybackCommand::PlayTrack(track_id)).ok();
                     }
                     PlaybackCommand::PlayFile(path) => {
+                        preparing_track_id = None;
                         sink = None;
                         current_track_id = None;
-                        current_file_path = None;
+                        current_file_path = Some(path.clone());
+                        current_duration = 0;
                         core.set_cur(None);
                         last_finished_track_id = None;
                         active_collection = None;
+                        is_paused = false;
+                        elapsed_before_pause = 0;
+                        playback_start = None;
                         if shuffle_enabled {
                             shuffle_enabled = false;
                             shuffle_tx.send(false).ok();
@@ -2229,7 +2324,6 @@ pub fn start_audio_thread(
                         ) {
                             Ok((new_sink, duration)) => {
                                 current_duration = duration;
-                                current_file_path = Some(path.clone());
                                 sink = Some(new_sink);
                                 is_paused = false;
                                 elapsed_before_pause = 0;
@@ -2237,20 +2331,20 @@ pub fn start_audio_thread(
                                 last_finished_track_id = None;
                             }
                             Err(err) => {
-                                current_duration = 0;
-                                current_file_path = None;
-                                elapsed_before_pause = 0;
-                                playback_start = None;
                                 msg_tx.send(err.to_string()).ok();
                             }
                         }
                     }
                     PlaybackCommand::Pause => {
                         preparing_track_id = None;
-                        if let Some(ref s) = sink {
-                            if !is_paused {
-                                elapsed_before_pause = current_pos;
-                                is_paused = true;
+                        if !is_paused
+                            && (sink.is_some()
+                                || has_restore_target(&current_track_id, &current_file_path))
+                        {
+                            elapsed_before_pause = current_pos;
+                            is_paused = true;
+                            playback_start = None;
+                            if let Some(ref s) = sink {
                                 s.pause();
                             }
                         }
@@ -2264,17 +2358,21 @@ pub fn start_audio_thread(
 
                         let current_track = current_track_id.as_ref().and_then(|id| core.track(id));
 
-                        if let Some(track) = current_track.as_ref().filter(|track| track.is_sc()) {
-                            let Some(handle) = stream_handle.as_ref() else {
+                        let Some(handle) = stream_handle.as_ref() else {
+                            if has_restore_target(&current_track_id, &current_file_path) {
+                                is_paused = false;
+                                playback_start = None;
                                 msg_tx
                                     .send(
                                         "No audio output available; waiting for another device"
                                             .to_string(),
                                     )
                                     .ok();
-                                continue;
-                            };
+                            }
+                            continue;
+                        };
 
+                        if let Some(track) = current_track.as_ref().filter(|track| track.is_sc()) {
                             sink = None;
                             msg_tx
                                 .send("Refreshing YouTube audio stream...".to_string())
@@ -2313,6 +2411,33 @@ pub fn start_audio_thread(
                             continue;
                         }
 
+                        if sink.is_none() {
+                            match restore_playback_on_handle(
+                                handle,
+                                &current_track_id,
+                                &current_file_path,
+                                &core,
+                                &sc_client,
+                                fft_processor.clone(),
+                                visualizer_tx.clone(),
+                                visualizer_enabled.clone(),
+                                volume,
+                                resume_pos,
+                            ) {
+                                Ok(Some((new_sink, duration))) => {
+                                    current_duration = duration;
+                                    sink = Some(new_sink);
+                                    is_paused = false;
+                                    playback_start = Some(Instant::now());
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    msg_tx.send(err.to_string()).ok();
+                                }
+                            }
+                            continue;
+                        }
+
                         if let Some(ref s) = sink {
                             is_paused = false;
                             playback_start = Some(Instant::now());
@@ -2320,12 +2445,16 @@ pub fn start_audio_thread(
                         }
                     }
                     PlaybackCommand::TogglePause => {
-                        if let Some(ref s) = sink {
-                            if is_paused {
-                                tx_clone.send(PlaybackCommand::Resume).ok();
-                            } else {
-                                elapsed_before_pause = current_pos;
-                                is_paused = true;
+                        if is_paused {
+                            tx_clone.send(PlaybackCommand::Resume).ok();
+                        } else if sink.is_some()
+                            || has_restore_target(&current_track_id, &current_file_path)
+                        {
+                            preparing_track_id = None;
+                            elapsed_before_pause = current_pos;
+                            is_paused = true;
+                            playback_start = None;
+                            if let Some(ref s) = sink {
                                 s.pause();
                             }
                         }
@@ -2411,6 +2540,8 @@ pub fn start_audio_thread(
                         let current_track = current_track_id.as_ref().and_then(|id| core.track(id));
                         if let Some(track) = current_track.as_ref().filter(|track| track.is_sc()) {
                             let Some(handle) = stream_handle.as_ref() else {
+                                elapsed_before_pause = new_pos;
+                                playback_start = None;
                                 msg_tx
                                     .send(
                                         "No audio output available; waiting for another device"
@@ -2451,6 +2582,54 @@ pub fn start_audio_thread(
                                 ));
                             });
                         } else {
+                            if sink.is_none() {
+                                elapsed_before_pause = new_pos;
+                                playback_start = None;
+
+                                let Some(handle) = stream_handle.as_ref() else {
+                                    if has_restore_target(&current_track_id, &current_file_path) {
+                                        msg_tx
+                                            .send(
+                                                "No audio output available; waiting for another device"
+                                                    .to_string(),
+                                            )
+                                            .ok();
+                                    }
+                                    continue;
+                                };
+
+                                match restore_playback_on_handle(
+                                    handle,
+                                    &current_track_id,
+                                    &current_file_path,
+                                    &core,
+                                    &sc_client,
+                                    fft_processor.clone(),
+                                    visualizer_tx.clone(),
+                                    visualizer_enabled.clone(),
+                                    volume,
+                                    new_pos,
+                                ) {
+                                    Ok(Some((new_sink, duration))) => {
+                                        if is_paused {
+                                            new_sink.pause();
+                                        }
+                                        current_duration = duration;
+                                        sink = Some(new_sink);
+                                        playback_start = if is_paused {
+                                            None
+                                        } else {
+                                            Some(Instant::now())
+                                        };
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        msg_tx.send(err.to_string()).ok();
+                                    }
+                                }
+                                continue;
+                            }
+
                             if let Err(err) = seek_current_sink(
                                 &mut sink,
                                 stream_handle.as_ref(),
@@ -2499,9 +2678,11 @@ pub fn start_audio_thread(
                             last_finished_track_id = None;
                             tx_clone.send(PlaybackCommand::PlayTrack(next_id)).ok();
                         } else {
+                            preparing_track_id = None;
                             sink = None;
                             current_track_id = None;
                             current_file_path = None;
+                            current_duration = 0;
                             core.set_cur(None);
                             last_finished_track_id = None;
                             is_paused = false;
@@ -2623,9 +2804,9 @@ pub fn start_audio_thread(
                         let saved_position = current_pos;
                         let was_playing = !is_paused
                             && (sink.is_some()
-                                || saved_track_id.is_some()
-                                || saved_file_path.is_some());
+                                || has_restore_target(&saved_track_id, &saved_file_path));
 
+                        preparing_track_id = None;
                         sink = None;
                         stream_handle = None;
                         _stream = None;
@@ -2699,9 +2880,8 @@ pub fn start_audio_thread(
                                 }
                                 Err(e) => {
                                     last_finished_track_id = None;
-                                    current_track_id = None;
-                                    current_file_path = None;
-                                    core.set_cur(None);
+                                    sink = None;
+                                    playback_start = None;
                                     msg_tx.send(e).ok();
                                 }
                             }
@@ -2730,5 +2910,85 @@ pub fn start_audio_thread(
         volume_rx,
         visualizer_rx,
         msg_rx,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        output_recovery_needed, playback_completion_confirmed, OUTPUT_DEVICE_MISSING_GRACE,
+        PLAYBACK_FINISH_DEBOUNCE,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn playback_completion_waits_for_debounce_when_not_near_track_end() {
+        let now = Instant::now();
+        let mut empty_since = None;
+
+        assert!(!playback_completion_confirmed(
+            true,
+            12,
+            120,
+            &mut empty_since,
+            now,
+        ));
+        assert!(!playback_completion_confirmed(
+            true,
+            12,
+            120,
+            &mut empty_since,
+            now + PLAYBACK_FINISH_DEBOUNCE - Duration::from_millis(1),
+        ));
+        assert!(playback_completion_confirmed(
+            true,
+            12,
+            120,
+            &mut empty_since,
+            now + PLAYBACK_FINISH_DEBOUNCE,
+        ));
+    }
+
+    #[test]
+    fn playback_completion_finishes_immediately_near_known_end() {
+        let now = Instant::now();
+        let mut empty_since = None;
+
+        assert!(playback_completion_confirmed(
+            true,
+            119,
+            120,
+            &mut empty_since,
+            now,
+        ));
+    }
+
+    #[test]
+    fn output_recovery_waits_for_sustained_device_loss() {
+        let now = Instant::now();
+        let mut missing_since = None;
+        let devices = vec!["Speakers".to_string()];
+
+        assert!(!output_recovery_needed(
+            true,
+            Some("Headphones"),
+            &devices,
+            &mut missing_since,
+            now,
+        ));
+        assert!(!output_recovery_needed(
+            true,
+            Some("Headphones"),
+            &devices,
+            &mut missing_since,
+            now + OUTPUT_DEVICE_MISSING_GRACE - Duration::from_millis(1),
+        ));
+        assert!(output_recovery_needed(
+            true,
+            Some("Headphones"),
+            &devices,
+            &mut missing_since,
+            now + OUTPUT_DEVICE_MISSING_GRACE,
+        ));
     }
 }
