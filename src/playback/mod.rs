@@ -80,7 +80,7 @@ pub enum PlaybackCommand {
     SetAutoplay(bool),
     ListDevices,
     SwitchDevice(String),
-    Prepared(Result<(Sink, u64), String>, String, u64),
+    Prepared(Result<(Sink, u64), String>, String, u64, bool, bool),
 }
 
 impl Clone for PlaybackCommand {
@@ -124,7 +124,9 @@ impl Clone for PlaybackCommand {
             Self::SetAutoplay(v) => Self::SetAutoplay(*v),
             Self::ListDevices => Self::ListDevices,
             Self::SwitchDevice(s) => Self::SwitchDevice(s.clone()),
-            Self::Prepared(_, _, _) => panic!("PlaybackCommand::Prepared cannot be cloned"),
+            Self::Prepared(_, _, _, _, _) => {
+                panic!("PlaybackCommand::Prepared cannot be cloned")
+            }
         }
     }
 }
@@ -170,7 +172,7 @@ impl std::fmt::Debug for PlaybackCommand {
             Self::SetAutoplay(v) => f.debug_tuple("SetAutoplay").field(v).finish(),
             Self::ListDevices => write!(f, "ListDevices"),
             Self::SwitchDevice(s) => f.debug_tuple("SwitchDevice").field(s).finish(),
-            Self::Prepared(res, id, offset) => f
+            Self::Prepared(res, id, offset, paused, preserve_existing_on_error) => f
                 .debug_tuple("Prepared")
                 .field(
                     &res.as_ref()
@@ -179,6 +181,8 @@ impl std::fmt::Debug for PlaybackCommand {
                 )
                 .field(id)
                 .field(offset)
+                .field(paused)
+                .field(preserve_existing_on_error)
                 .finish(),
         }
     }
@@ -813,7 +817,10 @@ fn sink_from_remote_track_at(
         };
 
         if start_at_secs > 0 {
-            let _ = sink.try_seek(Duration::from_secs(start_at_secs));
+            sink.try_seek(Duration::from_secs(start_at_secs))
+                .map_err(|err| {
+                    anyhow::anyhow!("Seek failed after opening cached remote audio: {:?}", err)
+                })?;
         }
 
         return Ok((
@@ -924,7 +931,13 @@ fn sink_from_remote_track_at(
     };
 
     if start_at_secs > 0 {
-        let _ = sink.try_seek(Duration::from_secs(start_at_secs));
+        sink.try_seek(Duration::from_secs(start_at_secs))
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "Seek failed after opening downloaded remote audio: {:?}",
+                    err
+                )
+            })?;
     }
 
     Ok((
@@ -1644,7 +1657,10 @@ fn restore_playback_on_handle(
         )?;
 
         if start_at_secs > 0 {
-            let _ = sink.try_seek(Duration::from_secs(start_at_secs));
+            sink.try_seek(Duration::from_secs(start_at_secs))
+                .map_err(|err| {
+                    anyhow::anyhow!("Seek failed after reopening local file: {:?}", err)
+                })?;
         }
 
         return Ok(Some((sink, duration)));
@@ -1823,6 +1839,13 @@ fn has_restore_target(
     current_file_path: &Option<String>,
 ) -> bool {
     current_track_id.is_some() || current_file_path.is_some()
+}
+
+fn restore_target_is_remote(core: &Core, current_track_id: &Option<String>) -> bool {
+    current_track_id
+        .as_deref()
+        .and_then(|id| core.track(id))
+        .is_some_and(|track| track.is_sc())
 }
 
 fn output_recovery_needed(
@@ -2014,9 +2037,14 @@ pub fn start_audio_thread(
                             if sink.is_some() {
                                 current_duration = recovered.duration;
                                 is_paused = !was_playing;
-                                playback_start = Some(Instant::now());
+                                playback_start = if was_playing {
+                                    Some(Instant::now())
+                                } else {
+                                    None
+                                };
                             }
-                            waiting_for_output_recovery = false;
+                            waiting_for_output_recovery =
+                                sink.is_none() && restore_target_is_remote(&core, &saved_track_id);
 
                             let recovery_msg = if let Some(old_name) = previous_device_name {
                                 if old_name == recovered.device_name {
@@ -2047,6 +2075,45 @@ pub fn start_audio_thread(
                                 waiting_for_output_recovery = true;
                             }
                         }
+                    }
+                } else if waiting_for_output_recovery
+                    && sink.is_none()
+                    && preparing_track_id.is_none()
+                    && restore_target_is_remote(&core, &current_track_id)
+                {
+                    let Some(handle) = stream_handle.as_ref() else {
+                        continue;
+                    };
+
+                    match restore_playback_on_handle(
+                        handle,
+                        &current_track_id,
+                        &current_file_path,
+                        &core,
+                        &sc_client,
+                        fft_processor.clone(),
+                        visualizer_tx.clone(),
+                        visualizer_enabled.clone(),
+                        volume,
+                        elapsed_before_pause,
+                    ) {
+                        Ok(Some((new_sink, duration))) => {
+                            current_duration = duration;
+                            if is_paused {
+                                new_sink.pause();
+                                playback_start = None;
+                            } else {
+                                new_sink.play();
+                                playback_start = Some(Instant::now());
+                            }
+                            sink = Some(new_sink);
+                            waiting_for_output_recovery = false;
+                            last_finished_track_id = None;
+                        }
+                        Ok(None) => {
+                            waiting_for_output_recovery = false;
+                        }
+                        Err(_) => {}
                     }
                 } else {
                     waiting_for_output_recovery = false;
@@ -2145,8 +2212,18 @@ pub fn start_audio_thread(
                                     visualizer_enabled,
                                     volume,
                                 )
+                                .map(|(new_sink, duration)| {
+                                    new_sink.pause();
+                                    (new_sink, duration)
+                                })
                                 .map_err(|e| e.to_string());
-                                let _ = tx.send(PlaybackCommand::Prepared(res, track_clone.id, 0));
+                                let _ = tx.send(PlaybackCommand::Prepared(
+                                    res,
+                                    track_clone.id,
+                                    0,
+                                    false,
+                                    false,
+                                ));
                             });
                         }
                     }
@@ -2213,8 +2290,18 @@ pub fn start_audio_thread(
                                     visualizer_enabled,
                                     volume,
                                 )
+                                .map(|(new_sink, duration)| {
+                                    new_sink.pause();
+                                    (new_sink, duration)
+                                })
                                 .map_err(|e| e.to_string());
-                                let _ = tx.send(PlaybackCommand::Prepared(res, track_clone.id, 0));
+                                let _ = tx.send(PlaybackCommand::Prepared(
+                                    res,
+                                    track_clone.id,
+                                    0,
+                                    false,
+                                    false,
+                                ));
                             });
 
                             if let Ok(mut rpc) = discord_rpc.lock() {
@@ -2331,6 +2418,10 @@ pub fn start_audio_thread(
                                 last_finished_track_id = None;
                             }
                             Err(err) => {
+                                current_file_path = None;
+                                current_duration = 0;
+                                elapsed_before_pause = 0;
+                                playback_start = None;
                                 msg_tx.send(err.to_string()).ok();
                             }
                         }
@@ -2373,7 +2464,6 @@ pub fn start_audio_thread(
                         };
 
                         if let Some(track) = current_track.as_ref().filter(|track| track.is_sc()) {
-                            sink = None;
                             msg_tx
                                 .send("Refreshing YouTube audio stream...".to_string())
                                 .ok();
@@ -2399,12 +2489,18 @@ pub fn start_audio_thread(
                                     volume,
                                     resume_pos,
                                 )
+                                .map(|(new_sink, duration)| {
+                                    new_sink.pause();
+                                    (new_sink, duration)
+                                })
                                 .map_err(|e| e.to_string());
 
                                 let _ = tx.send(PlaybackCommand::Prepared(
                                     res,
                                     track_clone.id,
                                     resume_pos,
+                                    false,
+                                    true,
                                 ));
                             });
 
@@ -2551,9 +2647,9 @@ pub fn start_audio_thread(
                                 continue;
                             };
 
-                            sink = None;
                             msg_tx.send("Seeking YouTube audio...".to_string()).ok();
 
+                            let paused_after_seek = is_paused;
                             preparing_track_id = Some(track.id.clone());
                             let tx = tx_clone.clone();
                             let sc_client = Arc::clone(&sc_client);
@@ -2574,11 +2670,17 @@ pub fn start_audio_thread(
                                     volume,
                                     new_pos,
                                 )
+                                .map(|(new_sink, duration)| {
+                                    new_sink.pause();
+                                    (new_sink, duration)
+                                })
                                 .map_err(|e| e.to_string());
                                 let _ = tx.send(PlaybackCommand::Prepared(
                                     res,
                                     track_clone.id,
                                     new_pos,
+                                    paused_after_seek,
+                                    true,
                                 ));
                             });
                         } else {
@@ -2837,10 +2939,15 @@ pub fn start_audio_thread(
                                 if sink.is_some() {
                                     current_duration = recovered.duration;
                                     is_paused = !was_playing;
-                                    playback_start = Some(Instant::now());
+                                    playback_start = if was_playing {
+                                        Some(Instant::now())
+                                    } else {
+                                        None
+                                    };
                                     last_finished_track_id = None;
                                 }
-                                waiting_for_output_recovery = false;
+                                waiting_for_output_recovery = sink.is_none()
+                                    && restore_target_is_remote(&core, &saved_track_id);
 
                                 if let Some(err) = recovered.restore_error {
                                     msg_tx.send(err).ok();
@@ -2851,7 +2958,13 @@ pub fn start_audio_thread(
                             }
                         }
                     }
-                    PlaybackCommand::Prepared(res, id, offset) => {
+                    PlaybackCommand::Prepared(
+                        res,
+                        id,
+                        offset,
+                        paused_on_success,
+                        preserve_existing_on_error,
+                    ) => {
                         if preparing_track_id.as_deref() == Some(id.as_str()) {
                             preparing_track_id = None;
                             match res {
@@ -2866,9 +2979,20 @@ pub fn start_audio_thread(
                                     core.set_cur(Some(id.clone()));
                                     core.add_hist(id);
                                     sink = Some(new_sink);
-                                    is_paused = false;
                                     elapsed_before_pause = offset;
-                                    playback_start = Some(Instant::now());
+                                    if paused_on_success {
+                                        if let Some(ref s) = sink {
+                                            s.pause();
+                                        }
+                                        is_paused = true;
+                                        playback_start = None;
+                                    } else {
+                                        if let Some(ref s) = sink {
+                                            s.play();
+                                        }
+                                        is_paused = false;
+                                        playback_start = Some(Instant::now());
+                                    }
                                     if let Some(track) =
                                         core.track(current_track_id.as_ref().unwrap())
                                     {
@@ -2880,8 +3004,10 @@ pub fn start_audio_thread(
                                 }
                                 Err(e) => {
                                     last_finished_track_id = None;
-                                    sink = None;
-                                    playback_start = None;
+                                    if !preserve_existing_on_error {
+                                        sink = None;
+                                        playback_start = None;
+                                    }
                                     msg_tx.send(e).ok();
                                 }
                             }
