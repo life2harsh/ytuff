@@ -48,7 +48,7 @@ Local library + YouTube Music + queue + artwork
 
 ### Windows
 
-Winget: pending the MSI submission for `HarshJha.YTuff`.
+Winget: ```winget install ytuff```
 
 Download the latest Windows installer from Releases:
 
