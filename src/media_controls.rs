@@ -1,11 +1,15 @@
 use crate::core::track::Track;
 use crate::playback::PlaybackCommand;
-use anyhow::{anyhow, Context, Result};
+#[cfg(target_os = "windows")]
+use anyhow::anyhow;
+use anyhow::{Context, Result};
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
     SeekDirection,
 };
-use std::sync::mpsc::{self, Sender};
+#[cfg(target_os = "windows")]
+use std::sync::mpsc;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 pub struct MediaSession {
