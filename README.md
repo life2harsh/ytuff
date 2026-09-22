@@ -271,6 +271,7 @@ Press `?` or `h` inside YTuff to open the built in help.
 | `d`              | Audio devices                                          |
 | `F`              | Local folders                                          |
 | `v`              | Visualizer                                             |
+| `B`              | Toggle the buffering status indicator                 |
 | `j` / `k`        | Move selection                                         |
 | `J` / `K`        | Move inside queue                                      |
 | `M`              | Minimize to tray                                       |
@@ -533,6 +534,7 @@ youtube_cookie_header
 youtube_cookie_file
 youtube_auth_user
 start_background_on_boot
+show_buffering_status
 ```
 
 ## Development
@@ -660,4 +662,3 @@ ytuff auth headers-file headers.json
 ### The Windows zip works on your machine but not on another PC
 
 You probably forgot the `wimg` DLLs, `WebView2Loader.dll`, or the FFmpeg files. Ship the full Windows file set listed above.
-

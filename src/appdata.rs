@@ -124,6 +124,12 @@ pub struct AppConfig {
     pub youtube_cookie_file: Option<PathBuf>,
     pub youtube_auth_user: Option<String>,
     pub start_background_on_boot: bool,
+    #[serde(default = "default_true")]
+    pub show_buffering_status: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -140,6 +146,7 @@ impl Default for AppConfig {
             youtube_cookie_file: None,
             youtube_auth_user: None,
             start_background_on_boot: false,
+            show_buffering_status: true,
         }
     }
 }
@@ -682,5 +689,17 @@ mod tests {
             parse_cookie_source(raw).as_deref(),
             Some("VISITOR_INFO1_LIVE=abc; SID=def")
         );
+    }
+
+    #[test]
+    fn existing_config_defaults_buffering_status_to_visible() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("show_buffering_status");
+
+        let config: AppConfig = serde_json::from_value(value).unwrap();
+        assert!(config.show_buffering_status);
     }
 }
