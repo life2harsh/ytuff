@@ -34,6 +34,7 @@ pub fn start_daemon_playback_proxy(core: Core, daemon_addr: String) -> PlaybackH
         let mut last_shuffle: Option<bool> = None;
         let mut last_volume: Option<f32> = None;
         let mut last_devices: Option<Vec<(String, bool)>> = None;
+        let mut last_playback_message: Option<String> = None;
         let mut last_track_state: Option<(Option<String>, Vec<String>)> = None;
 
         let mut next_poll = Instant::now();
@@ -80,6 +81,13 @@ pub fn start_daemon_playback_proxy(core: Core, daemon_addr: String) -> PlaybackH
             if last_devices.as_ref() != Some(&status.devices) {
                 last_devices = Some(status.devices.clone());
                 let _ = devices_tx.send(status.devices.clone());
+            }
+
+            if last_playback_message != status.playback_message {
+                last_playback_message = status.playback_message.clone();
+                if let Some(message) = status.playback_message.as_ref() {
+                    let _ = msg_tx.send(message.clone());
+                }
             }
         };
 
