@@ -354,12 +354,13 @@ fn main() -> Result<()> {
         Some(Command::Config) => print_json_or_text(&runtime.cfg, cli.json, || {
             let downloads = runtime.cfg.effective_downloads_dir(&runtime.paths);
             format!(
-                "quality: {}\nscan paths: {}\ndownloads: {}\nautoplay: {}\nlyrics: {}\nbackground on boot: {}",
+                "quality: {}\nscan paths: {}\ndownloads: {}\nautoplay: {}\nlyrics: {}\nbuffering status: {}\nbackground on boot: {}",
                 runtime.cfg.quality,
                 runtime.cfg.scan_paths.len(),
                 downloads.display(),
                 runtime.cfg.autoplay,
                 runtime.cfg.lyrics_enabled,
+                runtime.cfg.show_buffering_status,
                 runtime.cfg.start_background_on_boot
             )
         }),
@@ -1252,6 +1253,9 @@ fn format_status(status: &crate::daemon::PlayerStatus) -> String {
     lines.push(format!("autoplay: {}", status.autoplay));
     if let Some(remaining) = status.sleep_remaining_secs {
         lines.push(format!("sleep: {}s", remaining));
+    }
+    if let Some(message) = status.playback_message.as_ref() {
+        lines.push(format!("playback: {message}"));
     }
     lines.join("\n")
 }
