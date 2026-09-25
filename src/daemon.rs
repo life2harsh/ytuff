@@ -46,6 +46,7 @@ pub enum RpcRequest {
     SetAutoplay { enabled: bool },
     SetSleep { minutes: Option<u64> },
     Lyrics { cached: bool },
+    ReloadAuth,
     Shutdown,
 }
 
@@ -71,10 +72,14 @@ pub struct PlayerStatus {
     pub is_playing: bool,
     pub sleep_remaining_secs: Option<u64>,
     pub lyrics_cached: bool,
+    #[serde(default)]
+    pub playback_message: Option<String>,
 }
 
 struct SharedState {
+    paths: AppPaths,
     core: Core,
+    sc: Arc<Mutex<SoundCloudClient>>,
     pb_tx: Sender<PlaybackCommand>,
     position: Arc<Mutex<Option<(u64, u64, bool)>>>,
     repeat_mode: Arc<Mutex<RepeatMode>>,
@@ -84,6 +89,7 @@ struct SharedState {
     cfg: Arc<Mutex<AppConfig>>,
     lyrics: LyricsClient,
     current_lyrics: Arc<Mutex<Option<LyricsDoc>>>,
+    playback_message: Arc<Mutex<Option<String>>>,
     sleep_deadline: Arc<Mutex<Option<Instant>>>,
     shutdown: Arc<AtomicBool>,
 }
@@ -126,8 +132,11 @@ pub fn run_daemon(paths: AppPaths, config: AppConfig) -> Result<()> {
     let shuffle_on = Arc::new(Mutex::new(false));
     let volume = Arc::new(Mutex::new(1.0f32));
     let devices = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
+    let playback_message = Arc::new(Mutex::new(None::<String>));
     let state = SharedState {
+        paths: paths.clone(),
         core,
+        sc,
         pb_tx: pb.tx.clone(),
         position: pb.position_rx.clone(),
         repeat_mode: repeat_mode.clone(),
@@ -137,6 +146,7 @@ pub fn run_daemon(paths: AppPaths, config: AppConfig) -> Result<()> {
         cfg: cfg.clone(),
         lyrics: LyricsClient::new(paths.clone()),
         current_lyrics: Arc::new(Mutex::new(None)),
+        playback_message,
         sleep_deadline: Arc::new(Mutex::new(None)),
         shutdown: Arc::new(AtomicBool::new(false)),
     };
@@ -148,7 +158,9 @@ pub fn run_daemon(paths: AppPaths, config: AppConfig) -> Result<()> {
         pb.shuffle_rx,
         pb.volume_rx,
         pb.devices_rx,
+        pb.msg_rx,
     );
+    state.pb_tx.send(PlaybackCommand::ListDevices).ok();
     start_runtime_monitor(state.clone());
 
     let addr = state.cfg.lock().unwrap().daemon_addr.clone();
@@ -322,6 +334,7 @@ fn apply_request(request: RpcRequest, state: &Arc<SharedState>) -> Result<String
         RpcRequest::PlayTrack { track } => {
             put_track(state, &track);
             state.core.clear_queue();
+            *state.playback_message.lock().unwrap() = None;
             state
                 .pb_tx
                 .send(PlaybackCommand::PlayNow(track.id.clone()))?;
@@ -335,6 +348,7 @@ fn apply_request(request: RpcRequest, state: &Arc<SharedState>) -> Result<String
                 put_track(state, track);
             }
             state.core.clear_queue();
+            *state.playback_message.lock().unwrap() = None;
             for track in tracks.iter().skip(1) {
                 state.core.enqueue(track.id.clone());
             }
@@ -458,6 +472,13 @@ fn apply_request(request: RpcRequest, state: &Arc<SharedState>) -> Result<String
                 Err(anyhow!("No lyrics found for the current track"))
             }
         }
+        RpcRequest::ReloadAuth => {
+            let fresh = AppConfig::load(&state.paths)?;
+            let client = make_client(&fresh)?;
+            *state.sc.lock().unwrap() = client;
+            *state.cfg.lock().unwrap() = fresh;
+            Ok("YouTube session reloaded".to_string())
+        }
         RpcRequest::Shutdown => {
             state.shutdown.store(true, Ordering::Relaxed);
             state.pb_tx.send(PlaybackCommand::Quit)?;
@@ -490,6 +511,7 @@ fn status_snapshot(state: &Arc<SharedState>) -> PlayerStatus {
         .unwrap()
         .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_secs());
     let lyrics_cached = state.current_lyrics.lock().unwrap().is_some();
+    let playback_message = state.playback_message.lock().unwrap().clone();
 
     PlayerStatus {
         current,
@@ -504,6 +526,7 @@ fn status_snapshot(state: &Arc<SharedState>) -> PlayerStatus {
         is_playing,
         sleep_remaining_secs,
         lyrics_cached,
+        playback_message,
     }
 }
 
@@ -513,6 +536,7 @@ fn start_playback_state_monitor(
     shuffle_rx: Receiver<bool>,
     volume_rx: Receiver<f32>,
     devices_rx: Receiver<Vec<(String, bool)>>,
+    msg_rx: Receiver<String>,
 ) {
     thread::spawn(move || loop {
         if state.shutdown.load(Ordering::Relaxed) {
@@ -530,6 +554,9 @@ fn start_playback_state_monitor(
         }
         while let Ok(devs) = devices_rx.try_recv() {
             *state.devices.lock().unwrap() = devs;
+        }
+        while let Ok(message) = msg_rx.try_recv() {
+            *state.playback_message.lock().unwrap() = Some(message);
         }
 
         thread::sleep(Duration::from_millis(50));
