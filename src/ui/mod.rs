@@ -2,6 +2,7 @@ use crate::appdata::{AppConfig, AppPaths};
 use crate::auth::{youtube_login_window, AuthSession};
 use crate::core::track::{Acc, Track};
 use crate::core::Core;
+use crate::daemon::{send_request, RpcRequest};
 use crate::downloads::{download_track, DownloadFormat};
 use crate::lyrics::{LyricsClient, LyricsDoc};
 use crate::playback::{CollectionKind, PlaybackCommand, PlaybackHandle, RepeatMode};
@@ -126,6 +127,9 @@ pub struct App {
     sc_info: ScState,
     fld: Option<usize>,
     msg: Option<(String, Instant)>,
+    buffering_started: Option<Instant>,
+    playback_error: Option<String>,
+    show_buffering_status: bool,
     autoplay: bool,
     repeat_mode: RepeatMode,
     shuffle_on: bool,
@@ -144,7 +148,7 @@ pub struct App {
 }
 
 impl App {
-    fn new(core: Core, pb: PlaybackHandle, sc: ScSrv) -> Self {
+    fn new(core: Core, pb: PlaybackHandle, sc: ScSrv, show_buffering_status: bool) -> Self {
         let mut lib_st = ListState::default();
         lib_st.select(Some(0));
         let mut sc_st = ListState::default();
@@ -194,6 +198,9 @@ impl App {
             sc_info: ScState::default(),
             fld: None,
             msg: None,
+            buffering_started: None,
+            playback_error: None,
+            show_buffering_status,
             autoplay: false,
             repeat_mode: RepeatMode::Off,
             shuffle_on: false,
@@ -214,6 +221,20 @@ impl App {
 
     fn note(&mut self, msg: impl Into<String>) {
         self.msg = Some((msg.into(), Instant::now()));
+    }
+
+    fn playback_note(&mut self, msg: String) {
+        if msg == "Buffering YouTube audio..." {
+            self.buffering_started.get_or_insert_with(Instant::now);
+            self.playback_error = None;
+        } else if msg == "Playback started" {
+            self.buffering_started = None;
+            self.playback_error = None;
+        } else if self.buffering_started.is_some() || is_playback_error(&msg) {
+            self.buffering_started = None;
+            self.playback_error = Some(msg.clone());
+        }
+        self.note(msg);
     }
 
     fn clean_msg(&mut self) {
@@ -895,8 +916,9 @@ pub fn run_ui(
         }
     });
 
-    let sc = start_sc(sc_cli, playback_sc_cli, paths, cfg.clone());
-    let mut app = App::new(core, pb, sc);
+    let sc = start_sc(sc_cli, playback_sc_cli, paths.clone(), cfg.clone());
+    let show_buffering_status = cfg.lock().unwrap().show_buffering_status;
+    let mut app = App::new(core, pb, sc, show_buffering_status);
     let _ = app.sc.tx.send(ScReq::Init);
     let _ = app.pb.tx.send(PlaybackCommand::ListDevices);
     let mut overlay_was_active = false;
@@ -922,7 +944,7 @@ pub fn run_ui(
             app.viz = v;
         }
         while let Ok(msg) = app.pb.msg_rx.try_recv() {
-            app.note(msg);
+            app.playback_note(msg);
         }
         while let Ok(ev) = app.sc.rx.try_recv() {
             match ev {
@@ -1273,6 +1295,25 @@ pub fn run_ui(
                             app.show_viz = !app.show_viz;
                             let _ = app.pb.tx.send(PlaybackCommand::ToggleVisualizer);
                         }
+                        KeyCode::Char('B') => {
+                            app.show_buffering_status = !app.show_buffering_status;
+                            let saved = {
+                                let mut current = cfg.lock().unwrap();
+                                current.show_buffering_status = app.show_buffering_status;
+                                current.save(&paths).map_err(|err| err.to_string())
+                            };
+                            match saved {
+                                Ok(()) => app.note(format!(
+                                    "buffering status {}",
+                                    if app.show_buffering_status {
+                                        "on"
+                                    } else {
+                                        "off"
+                                    }
+                                )),
+                                Err(err) => app.note(err),
+                            }
+                        }
                         KeyCode::Char('A') => {
                             let _ = app.pb.tx.send(PlaybackCommand::ToggleAutoplay);
                         }
@@ -1386,6 +1427,7 @@ fn apply_auth_session(
     for client in clients {
         *client.lock().unwrap() = verified.clone();
     }
+    reload_daemon_auth(cfg)?;
     Ok(state)
 }
 
@@ -1413,7 +1455,15 @@ fn clear_auth_session(
     for client in clients.iter().skip(1) {
         let _ = client.lock().unwrap().logout();
     }
+    reload_daemon_auth(cfg)?;
     Ok(state)
+}
+
+fn reload_daemon_auth(cfg: &Arc<Mutex<AppConfig>>) -> Result<(), String> {
+    let addr = cfg.lock().unwrap().daemon_addr.clone();
+    send_request(&addr, &RpcRequest::ReloadAuth)
+        .map(|_| ())
+        .map_err(|err| format!("YouTube login was saved, but playback could not reload it: {err}"))
 }
 
 fn make_client_from_cfg(cfg: &AppConfig) -> Result<SoundCloudClient, String> {
@@ -2037,13 +2087,23 @@ fn draw_art_hint(f: &mut Frame, area: Rect, lines: &[&str], alignment: Alignment
 fn draw_info_box(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
     if let Some(tr) = app.cur_track() {
-        let (state_label, state_color) = playback_state_label(
-            app.pb
-                .position_rx
-                .lock()
-                .unwrap()
-                .is_some_and(|(_, _, on)| on),
-        );
+        let buffering_elapsed = app
+            .show_buffering_status
+            .then(|| app.buffering_started.map(|started| started.elapsed()))
+            .flatten();
+        let (state_label, state_color) = if buffering_elapsed.is_some() {
+            ("STARTING", Color::LightCyan)
+        } else if app.playback_error.is_some() {
+            ("ERROR", Color::LightRed)
+        } else {
+            playback_state_label(
+                app.pb
+                    .position_rx
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|(_, _, on)| on),
+            )
+        };
         lines.push(Line::from(Span::styled(
             format!(" {} ", state_label),
             Style::default()
@@ -2127,7 +2187,34 @@ fn draw_info_box(f: &mut Frame, app: &App, area: Rect) {
         }
         lines.push(Line::from(meta));
 
-        if let Some((cur, tot, on)) = *app.pb.position_rx.lock().unwrap() {
+        if let Some(elapsed) = buffering_elapsed {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    buffering_spinner(elapsed),
+                    Style::default().fg(Color::LightCyan).bold(),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    buffering_elapsed_label(elapsed),
+                    Style::default().fg(Color::Rgb(229, 234, 241)).bold(),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "Resolving the stream and filling the audio buffer",
+                Style::default().fg(Color::Rgb(170, 178, 190)),
+            )));
+        } else if let Some(error) = app.playback_error.as_deref() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Playback failed",
+                Style::default().fg(Color::LightRed).bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                error,
+                Style::default().fg(Color::Rgb(255, 170, 160)),
+            )));
+        } else if let Some((cur, tot, on)) = *app.pb.position_rx.lock().unwrap() {
             lines.push(Line::from(""));
             let shown_total = if tot == 0 { tr.dur.unwrap_or(0) } else { tot };
             lines.push(Line::from(vec![
@@ -2392,6 +2479,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("A toggle autoplay, l open YouTube login, L sign out"),
         Line::from("+/- volume, 0 mute"),
         Line::from("d audio devices, F local folders"),
+        Line::from("B toggle the buffering status indicator"),
         Line::from("v visualizer, j/k move, J/K queue"),
         Line::from("M minimize to tray (keep playback running)"),
         Line::from(""),
@@ -2699,6 +2787,30 @@ fn playback_state_label(is_playing: bool) -> (&'static str, Color) {
     }
 }
 
+fn is_playback_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "error",
+        "failed",
+        "could not",
+        "unavailable",
+        "not supported",
+        "sign in to confirm",
+        "no audio output",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn buffering_spinner(elapsed: Duration) -> &'static str {
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    FRAMES[(elapsed.as_millis() / 200) as usize % FRAMES.len()]
+}
+
+fn buffering_elapsed_label(elapsed: Duration) -> String {
+    format!("Starting playback · {}s elapsed", elapsed.as_secs())
+}
+
 fn clock(secs: u64) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
 }
@@ -2776,7 +2888,8 @@ fn centered(r: Rect, px: u16, py: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::trim;
+    use super::{buffering_elapsed_label, buffering_spinner, is_playback_error, trim};
+    use std::time::Duration;
 
     #[test]
     fn trim_handles_unicode_boundaries() {
@@ -2784,5 +2897,24 @@ mod tests {
         let trimmed = trim(title, 54);
         assert!(trimmed.ends_with("..."));
         assert!(trimmed.is_char_boundary(trimmed.len()));
+    }
+
+    #[test]
+    fn buffering_status_reports_elapsed_time() {
+        assert_eq!(
+            buffering_elapsed_label(Duration::from_millis(6_900)),
+            "Starting playback · 6s elapsed"
+        );
+        assert_eq!(buffering_spinner(Duration::from_millis(0)), "|");
+        assert_eq!(buffering_spinner(Duration::from_millis(200)), "/");
+    }
+
+    #[test]
+    fn resolver_failures_are_recognized_as_playback_errors() {
+        assert!(is_playback_error(
+            "YouTube stream resolution failed. Sign in to confirm you're not a bot"
+        ));
+        assert!(is_playback_error("No audio output available"));
+        assert!(!is_playback_error("Playback started"));
     }
 }
