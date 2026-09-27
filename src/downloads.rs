@@ -39,7 +39,7 @@ pub fn download_track(
     }
 
     let stream = client.stream(track)?;
-    let bytes = client.download_stream(&stream.url)?;
+    let bytes = client.download_stream(&stream.url, &stream.headers)?;
 
     match format {
         DownloadFormat::M4a => {

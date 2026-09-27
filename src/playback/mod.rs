@@ -839,8 +839,7 @@ fn sink_from_remote_track_at(
             .map_err(|_| anyhow::anyhow!("The YouTube client is unavailable"))?;
         let stream = client.stream(track)?;
         fallback_duration = stream.duration_secs.unwrap_or(fallback_duration);
-        let headers = client.ffmpeg_headers();
-        (stream.url, headers)
+        (stream.url, stream.headers)
     };
 
     match sink_from_ffmpeg_stream(
@@ -885,7 +884,7 @@ fn sink_from_remote_track_at(
             .map_err(|_| anyhow::anyhow!("The YouTube client is unavailable"))?
             .clone();
 
-        match client.download_stream(&stream.url) {
+        match client.download_stream(&stream.url, &stream.headers) {
             Ok(bytes) => bytes,
             Err(_) => {
                 {
@@ -904,7 +903,7 @@ fn sink_from_remote_track_at(
                     .lock()
                     .map_err(|_| anyhow::anyhow!("The YouTube client is unavailable"))?
                     .clone();
-                retry_client.download_stream(&retry.url)?
+                retry_client.download_stream(&retry.url, &retry.headers)?
             }
         }
     };
@@ -2993,6 +2992,7 @@ pub fn start_audio_thread(
                                         is_paused = false;
                                         playback_start = Some(Instant::now());
                                     }
+                                    msg_tx.send("Playback started".to_string()).ok();
                                     if let Some(track) =
                                         core.track(current_track_id.as_ref().unwrap())
                                     {

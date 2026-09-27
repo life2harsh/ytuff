@@ -3,7 +3,9 @@ use crate::proxy::{append_ytdlp_proxy_args, apply_command_proxy, apply_reqwest_p
 use anyhow::{anyhow, Context, Result};
 use percent_encoding::percent_decode_str;
 use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, CONTENT_RANGE, CONTENT_TYPE, RANGE, REFERER, USER_AGENT};
+use reqwest::header::{
+    HeaderName, HeaderValue, ACCEPT, CONTENT_RANGE, CONTENT_TYPE, RANGE, REFERER, USER_AGENT,
+};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -25,7 +27,7 @@ const WEB_REMIX_CLIENT_VERSION: &str = "1.20260502.01.00";
 const SEARCH_SONGS_FILTER: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
 const VISITOR_PREFIXES: [&str; 2] = ["Cgt", "Cgs"];
 const STREAM_DOWNLOAD_CHUNK_BYTES: u64 = 1024 * 1024 * 2;
-const YT_DLP_TIMEOUT_SECS: u64 = 8;
+const YT_DLP_TIMEOUT_SECS: u64 = 30;
 const HOME_BROWSE_ID: &str = "FEmusic_home";
 const LIBRARY_PLAYLISTS_BROWSE_ID: &str = "FEmusic_liked_playlists";
 
@@ -67,6 +69,7 @@ pub struct YtState {
 pub struct YtStream {
     pub url: String,
     pub duration_secs: Option<u64>,
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +97,7 @@ struct CachedStream {
     url: String,
     expires_at: u64,
     duration_secs: Option<u64>,
+    headers: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -225,159 +229,75 @@ impl PlaybackClient {
 enum LegacyStreamPlaybackClient {
     TvHtml5,
     TvEmbedded,
-    AndroidVr143,
-    AndroidVr161,
-    AndroidMobile,
-    Ios,
-    AndroidCreator,
+    Web,
 }
 
 impl LegacyStreamPlaybackClient {
-    fn all() -> [Self; 7] {
-        [
-            Self::TvEmbedded,
-            Self::TvHtml5,
-            Self::AndroidVr143,
-            Self::AndroidVr161,
-            Self::AndroidCreator,
-            Self::AndroidMobile,
-            Self::Ios,
-        ]
+    fn all() -> [Self; 3] {
+        [Self::TvEmbedded, Self::TvHtml5, Self::Web]
     }
 
     fn client_id(self) -> &'static str {
         match self {
             Self::TvHtml5 => "7",
-            Self::AndroidVr143 | Self::AndroidVr161 => "28",
-            Self::AndroidMobile => "3",
-            Self::Ios => "5",
-            Self::AndroidCreator => "14",
-            Self::TvEmbedded => "85",
+            Self::Web => "1",
+            Self::TvEmbedded => "56",
         }
     }
 
     fn client_name(self) -> &'static str {
         match self {
             Self::TvHtml5 => "TVHTML5",
-            Self::AndroidVr143 | Self::AndroidVr161 => "ANDROID_VR",
-            Self::AndroidMobile => "ANDROID",
-            Self::Ios => "IOS",
-            Self::AndroidCreator => "ANDROID_CREATOR",
-            Self::TvEmbedded => "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            Self::Web => "WEB",
+            Self::TvEmbedded => "WEB_EMBEDDED_PLAYER",
         }
     }
 
     fn client_version(self) -> &'static str {
         match self {
-            Self::TvHtml5 => "7.20260213.00.00",
-            Self::AndroidVr143 => "1.43.32",
-            Self::AndroidVr161 => "1.61.48",
-            Self::AndroidMobile => "21.03.38",
-            Self::Ios => "21.03.1",
-            Self::AndroidCreator => "25.03.101",
-            Self::TvEmbedded => "2.0",
+            Self::TvHtml5 => "5.20260707",
+            Self::Web => "2.20260708.00.00",
+            Self::TvEmbedded => "2.20260708.00.00",
         }
     }
 
     fn user_agent(self) -> &'static str {
         match self {
             Self::TvHtml5 => {
-                "Mozilla/5.0(SMART-TV; Linux; Tizen 4.0.0.2) AppleWebkit/605.1.15 (KHTML, like Gecko) SamsungBrowser/9.2 TV Safari/605.1.15"
+                "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version"
             }
-            Self::AndroidVr143 => {
-                "com.google.android.apps.youtube.vr.oculus/1.43.32 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)"
-            }
-            Self::AndroidVr161 => {
-                "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)"
-            }
-            Self::AndroidMobile => {
-                "com.google.android.youtube/21.03.38 (Linux; U; Android 14) gzip"
-            }
-            Self::Ios => {
-                "com.google.ios.youtube/21.03.1 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X;)"
-            }
-            Self::AndroidCreator => {
-                "com.google.android.apps.youtube.creator/25.03.101 (Linux; U; Android 15; en_US; Pixel 9 Pro Fold; Build/AP3A.241005.015.A2; Cronet/132.0.6779.0)"
+            Self::Web => {
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
             }
             Self::TvEmbedded => {
-                "Mozilla/5.0 (PlayStation; PlayStation 4/12.02) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
             }
         }
     }
 
     fn login_supported(self) -> bool {
-        matches!(
-            self,
-            Self::TvHtml5 | Self::TvEmbedded | Self::AndroidCreator | Self::AndroidMobile
-        )
+        true
     }
 
     fn request_body(self, visitor_data: &str, data_sync_id: Option<&str>, video_id: &str) -> Value {
         let client = match self {
             Self::TvHtml5 => json!({
                 "clientName": "TVHTML5",
-                "clientVersion": "7.20260213.00.00",
+                "clientVersion": "5.20260707",
                 "gl": "US",
                 "hl": "en-US",
                 "visitorData": visitor_data,
             }),
-            Self::AndroidVr143 => json!({
-                "clientName": "ANDROID_VR",
-                "clientVersion": "1.43.32",
-                "osName": "Android",
-                "osVersion": "12",
-                "deviceMake": "Oculus",
-                "deviceModel": "Quest 3",
-                "androidSdkVersion": "32",
-                "gl": "US",
-                "hl": "en-US",
-                "visitorData": visitor_data,
-            }),
-            Self::AndroidVr161 => json!({
-                "clientName": "ANDROID_VR",
-                "clientVersion": "1.61.48",
-                "osName": "Android",
-                "osVersion": "12",
-                "deviceMake": "Oculus",
-                "deviceModel": "Quest 3",
-                "androidSdkVersion": "32",
-                "gl": "US",
-                "hl": "en-US",
-                "visitorData": visitor_data,
-            }),
-            Self::AndroidMobile => json!({
-                "clientName": "ANDROID",
-                "clientVersion": "21.03.38",
-                "gl": "US",
-                "hl": "en-US",
-                "visitorData": visitor_data,
-            }),
-            Self::Ios => json!({
-                "clientName": "IOS",
-                "clientVersion": "21.03.1",
-                "osName": "iOS",
-                "osVersion": "18.2",
-                "deviceMake": "Apple",
-                "deviceModel": "iPhone16,2",
-                "gl": "US",
-                "hl": "en-US",
-                "visitorData": visitor_data,
-            }),
-            Self::AndroidCreator => json!({
-                "clientName": "ANDROID_CREATOR",
-                "clientVersion": "25.03.101",
-                "osName": "Android",
-                "osVersion": "15",
-                "deviceMake": "Google",
-                "deviceModel": "Pixel 9 Pro Fold",
-                "androidSdkVersion": "35",
+            Self::Web => json!({
+                "clientName": "WEB",
+                "clientVersion": "2.20260708.00.00",
                 "gl": "US",
                 "hl": "en-US",
                 "visitorData": visitor_data,
             }),
             Self::TvEmbedded => json!({
-                "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-                "clientVersion": "2.0",
+                "clientName": "WEB_EMBEDDED_PLAYER",
+                "clientVersion": "2.20260708.00.00",
                 "gl": "US",
                 "hl": "en-US",
                 "visitorData": visitor_data,
@@ -427,7 +347,7 @@ impl YouTubeClient {
         let media_http = apply_reqwest_proxy(
             Client::builder()
                 .connect_timeout(Duration::from_secs(20))
-                .user_agent(LegacyStreamPlaybackClient::AndroidVr143.user_agent()),
+                .user_agent(LegacyStreamPlaybackClient::Web.user_agent()),
         )
         .build()
         .unwrap_or_else(|_| Client::new());
@@ -567,19 +487,21 @@ impl YouTubeClient {
         self.cookie_header.is_some()
     }
 
-    pub fn ffmpeg_headers(&self) -> Vec<(String, String)> {
+    fn stream_headers(
+        &self,
+        user_agent: &str,
+        referer: &str,
+        include_auth: bool,
+    ) -> Vec<(String, String)> {
         let mut headers = vec![
-            (
-                "User-Agent".to_string(),
-                LegacyStreamPlaybackClient::AndroidVr143
-                    .user_agent()
-                    .to_string(),
-            ),
-            ("Referer".to_string(), VIDEO_REFERER.to_string()),
+            ("User-Agent".to_string(), user_agent.to_string()),
+            ("Referer".to_string(), referer.to_string()),
         ];
 
-        if let Some(cookie) = self.cookie_header.as_ref() {
-            headers.push(("Cookie".to_string(), cookie.clone()));
+        if include_auth {
+            if let Some(cookie) = self.cookie_header.as_ref() {
+                headers.push(("Cookie".to_string(), cookie.clone()));
+            }
         }
 
         headers
@@ -693,6 +615,7 @@ impl YouTubeClient {
                 return Ok(ScStream {
                     url: cached.url.clone(),
                     duration_secs: cached.duration_secs.or(tr.dur),
+                    headers: cached.headers.clone(),
                 });
             }
         }
@@ -703,19 +626,27 @@ impl YouTubeClient {
             .or_else(|| tr.id.strip_prefix("sc:"))
             .unwrap_or(tr.id.as_str());
 
-        match self
-            .resolve_stream_with_legacy_pipeline(video_id)
-            .or_else(|legacy_err| {
-                self.resolve_stream_with_ytdlp(video_id).context(format!(
-                    "legacy stream resolution failed first: {legacy_err:#}"
-                ))
-            }) {
+        let resolved = match self.resolve_stream_with_legacy_pipeline(video_id) {
+            Ok(stream) => Ok(stream),
+            Err(legacy_err) if std::env::var_os("YTUFF_NATIVE_ONLY").is_some() => {
+                Err(anyhow!("Native-only YouTube resolution failed: {legacy_err:#}"))
+            }
+            Err(legacy_err) => match self.resolve_stream_with_ytdlp(video_id) {
+                Ok(stream) => Ok(stream),
+                Err(ytdlp_err) => Err(anyhow!(
+                    "YouTube stream resolution failed. Native clients: {legacy_err:#}. yt-dlp fallback: {ytdlp_err:#}"
+                )),
+            },
+        };
+
+        match resolved {
             Ok(cached) => {
                 let duration_secs = cached.duration_secs.or(tr.dur);
                 self.stream_cache.insert(tr.id.clone(), cached.clone());
                 Ok(ScStream {
                     url: cached.url,
                     duration_secs,
+                    headers: cached.headers,
                 })
             }
             Err(err) => Err(err),
@@ -733,13 +664,13 @@ impl YouTubeClient {
         self.audio_cache.remove(track_id)
     }
 
-    pub fn download_stream(&self, url: &str) -> Result<Vec<u8>> {
-        let range_err = match self.download_stream_by_range(url) {
+    pub fn download_stream(&self, url: &str, headers: &[(String, String)]) -> Result<Vec<u8>> {
+        let range_err = match self.download_stream_by_range(url, headers) {
             Ok(bytes) => return Ok(bytes),
             Err(err) => err,
         };
 
-        self.media_request(url)
+        self.media_request(url, headers)
             .send()
             .and_then(|rsp| rsp.error_for_status())
             .context(format!(
@@ -771,7 +702,7 @@ impl YouTubeClient {
             let rsp = self
                 .with_stream_player_auth(
                     self.http
-                        .post(format!("{API_BASE}/player?prettyPrint=false")),
+                        .post(format!("{VIDEO_API_BASE}/player?prettyPrint=false")),
                     client.login_supported(),
                 )
                 .header(ACCEPT, "application/json")
@@ -779,9 +710,9 @@ impl YouTubeClient {
                 .header("X-Goog-Api-Format-Version", "1")
                 .header("X-YouTube-Client-Name", client.client_id())
                 .header("X-YouTube-Client-Version", client.client_version())
-                .header("X-Origin", MUSIC_ORIGIN)
+                .header("X-Origin", VIDEO_ORIGIN)
                 .header("X-Goog-Visitor-Id", &visitor)
-                .header(REFERER, MUSIC_REFERER)
+                .header(REFERER, VIDEO_REFERER)
                 .header(USER_AGENT, client.user_agent())
                 .json(&body)
                 .send();
@@ -824,10 +755,26 @@ impl YouTubeClient {
                     }
 
                     if let Some(choice) = pick_audio_stream(&json, self.ql) {
+                        let headers = self.stream_headers(
+                            client.user_agent(),
+                            VIDEO_REFERER,
+                            client.login_supported(),
+                        );
+                        if let Err(err) = self.validate_stream_url(&choice.url, &headers) {
+                            let message = format!(
+                                "{} returned a stream URL that was rejected: {err}",
+                                client.client_name()
+                            );
+                            attempts.push(message.clone());
+                            last_error = Some(anyhow!(message));
+                            continue;
+                        }
                         return Ok(CachedStream {
+                            duration_secs: video_duration_secs(&json)
+                                .or_else(|| stream_duration_secs(&choice.url)),
                             url: choice.url,
                             expires_at: choice.expires_at,
-                            duration_secs: video_duration_secs(&json),
+                            headers,
                         });
                     }
 
@@ -872,11 +819,22 @@ impl YouTubeClient {
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .context("yt-dlp returned no audio URL")?;
+        let headers = stdout
+            .lines()
+            .find_map(parse_ytdlp_headers)
+            .unwrap_or_else(|| {
+                self.stream_headers(
+                    LegacyStreamPlaybackClient::Web.user_agent(),
+                    VIDEO_REFERER,
+                    true,
+                )
+            });
 
         Ok(CachedStream {
             url: url.to_string(),
             expires_at: stream_expiration(url),
-            duration_secs: None,
+            duration_secs: stream_duration_secs(url),
+            headers,
         })
     }
 
@@ -887,14 +845,16 @@ impl YouTubeClient {
         cookie_file: Option<&std::path::Path>,
     ) -> Result<std::process::Output> {
         let mut common_args = vec![
-            "-m".to_string(),
-            "yt_dlp".to_string(),
             "--js-runtimes".to_string(),
             "node".to_string(),
             "--remote-components".to_string(),
             "ejs:github".to_string(),
             "--no-playlist".to_string(),
-            "-g".to_string(),
+            "--check-formats".to_string(),
+            "--print".to_string(),
+            "%(url)s".to_string(),
+            "--print".to_string(),
+            "%(http_headers)j".to_string(),
             "-f".to_string(),
             format.to_string(),
         ];
@@ -907,23 +867,32 @@ impl YouTubeClient {
         append_ytdlp_proxy_args(&mut common_args);
         common_args.push(watch_url.to_string());
 
-        let output = run_ytdlp_command("python", &common_args)
-            .or_else(|_| {
-                let mut py_args = vec!["-3".to_string()];
-                py_args.extend(common_args.clone());
-                run_ytdlp_command("py", &py_args)
-            })
-            .or_else(|_| run_ytdlp_command("yt-dlp", &common_args))
-            .context(
-                "Could not start yt-dlp. Install it with `python -m pip install --user yt-dlp` or `winget install yt-dlp`.",
-            )?;
+        let mut failures = Vec::new();
+        let mut commands = vec![("yt-dlp", common_args.clone())];
 
-        if output.status.success() {
-            return Ok(output);
+        let mut python_args = vec!["-m".to_string(), "yt_dlp".to_string()];
+        python_args.extend(common_args.clone());
+        commands.push(("python", python_args));
+
+        let mut py_args = vec!["-3".to_string(), "-m".to_string(), "yt_dlp".to_string()];
+        py_args.extend(common_args);
+        commands.push(("py", py_args));
+
+        for (program, args) in commands {
+            match run_ytdlp_command(program, &args) {
+                Ok(output) if output.status.success() => return Ok(output),
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    failures.push(format!("{program}: {}", stderr.trim()));
+                }
+                Err(err) => failures.push(format!("{program}: {err:#}")),
+            }
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(anyhow!(stderr.trim().to_string()))
+        Err(anyhow!(
+            "yt-dlp failed using every available launcher: {}",
+            failures.join(" | ")
+        ))
     }
 
     fn write_ytdlp_cookie_file(&self) -> Result<Option<std::path::PathBuf>> {
@@ -1073,17 +1042,50 @@ impl YouTubeClient {
         Err(last_error.unwrap_or_else(|| anyhow!("Could not resolve YouTube track metadata")))
     }
 
-    fn media_request(&self, url: &str) -> reqwest::blocking::RequestBuilder {
-        self.with_stream_media_auth(self.media_http.get(url).header(ACCEPT, "*/*").header(
-            USER_AGENT,
-            LegacyStreamPlaybackClient::AndroidVr143.user_agent(),
-        ))
+    fn media_request(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> reqwest::blocking::RequestBuilder {
+        let mut builder = self.media_http.get(url).header(ACCEPT, "*/*");
+        let mut has_cookie = false;
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("cookie") {
+                has_cookie = true;
+            }
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                builder = builder.header(name, value);
+            }
+        }
+        if !has_cookie {
+            builder = self.with_stream_media_auth(builder);
+        }
+        builder
     }
 
-    fn download_stream_by_range(&self, url: &str) -> Result<Vec<u8>> {
+    fn validate_stream_url(&self, url: &str, headers: &[(String, String)]) -> Result<()> {
+        let response = self
+            .media_request(url, headers)
+            .header(RANGE, "bytes=0-0")
+            .send()?
+            .error_for_status()?;
+        if matches!(
+            response.status(),
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT
+        ) {
+            Ok(())
+        } else {
+            Err(anyhow!("unexpected HTTP status {}", response.status()))
+        }
+    }
+
+    fn download_stream_by_range(&self, url: &str, headers: &[(String, String)]) -> Result<Vec<u8>> {
         let first_end = STREAM_DOWNLOAD_CHUNK_BYTES.saturating_sub(1);
         let first = self
-            .media_request(url)
+            .media_request(url, headers)
             .header(RANGE, format!("bytes=0-{first_end}"))
             .send()?
             .error_for_status()?;
@@ -1119,7 +1121,7 @@ impl YouTubeClient {
             let start = out.len() as u64;
             let end = (start + STREAM_DOWNLOAD_CHUNK_BYTES - 1).min(total - 1);
             let chunk = self
-                .media_request(url)
+                .media_request(url, headers)
                 .header(RANGE, format!("bytes={start}-{end}"))
                 .send()
                 .with_context(|| format!("Could not request stream bytes {start}-{end}"))?
@@ -1270,7 +1272,7 @@ impl YouTubeClient {
             }
             let auth_user = self.auth_user.as_deref().unwrap_or("0");
             builder = builder.header("X-Goog-AuthUser", auth_user);
-            if let Some(auth) = self.sapisid_hash(MUSIC_ORIGIN) {
+            if let Some(auth) = self.sapisid_hash(VIDEO_ORIGIN) {
                 builder = builder.header("Authorization", auth);
             }
         }
@@ -1341,9 +1343,21 @@ impl YouTubeClient {
     }
 }
 
+fn parse_ytdlp_headers(line: &str) -> Option<Vec<(String, String)>> {
+    let object = serde_json::from_str::<serde_json::Map<String, Value>>(line.trim()).ok()?;
+    let headers = object
+        .into_iter()
+        .filter_map(|(name, value)| value.as_str().map(|value| (name, value.to_string())))
+        .collect::<Vec<_>>();
+    (!headers.is_empty()).then_some(headers)
+}
+
 fn run_ytdlp_command(program: &str, args: &[String]) -> Result<std::process::Output> {
     let mut cmd = Command::new(program);
-    cmd.args(args);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     apply_command_proxy(&mut cmd);
     let mut child = cmd.spawn()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(YT_DLP_TIMEOUT_SECS);
@@ -2410,6 +2424,17 @@ fn stream_expiration(url: &str) -> u64 {
         .unwrap_or_else(|| now() + 1800)
 }
 
+fn stream_duration_secs(url: &str) -> Option<u64> {
+    Url::parse(url).ok().and_then(|parsed| {
+        parsed
+            .query_pairs()
+            .find(|(key, _)| key == "dur")
+            .and_then(|(_, value)| value.parse::<f64>().ok())
+            .filter(|duration| duration.is_finite() && *duration > 0.0)
+            .map(|duration| duration.ceil() as u64)
+    })
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2521,6 +2546,43 @@ mod tests {
         assert_eq!(parse_duration("3:47"), Some(227));
         assert_eq!(parse_duration("1:02:03"), Some(3723));
         assert_eq!(parse_duration("abc"), None);
+    }
+
+    #[test]
+    fn duration_falls_back_to_stream_url() {
+        assert_eq!(
+            stream_duration_secs("https://example.com/videoplayback?dur=153.181&itag=140"),
+            Some(154)
+        );
+        assert_eq!(
+            stream_duration_secs("https://example.com/videoplayback?itag=140"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ytdlp_launcher_captures_stdout() {
+        let output = run_ytdlp_command("printf", &["https://audio.example/stream\n".to_string()])
+            .expect("launcher should run");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "https://audio.example/stream\n"
+        );
+    }
+
+    #[test]
+    fn parses_ytdlp_stream_headers() {
+        let headers = parse_ytdlp_headers(
+            r#"{"User-Agent":"Mozilla/5.0","Referer":"https://www.youtube.com/"}"#,
+        )
+        .unwrap();
+        assert!(headers.contains(&("User-Agent".to_string(), "Mozilla/5.0".to_string())));
+        assert!(headers.contains(&(
+            "Referer".to_string(),
+            "https://www.youtube.com/".to_string()
+        )));
     }
 
     #[test]
@@ -2858,7 +2920,7 @@ mod tests {
             .expect("video should resolve");
         let stream = client.stream(&track).expect("stream should resolve");
         let bytes = client
-            .download_stream(&stream.url)
+            .download_stream(&stream.url, &stream.headers)
             .expect("stream should download");
         let (_, _, samples) = decode_m4a_bytes(bytes).expect("returned bytes should decode");
 
